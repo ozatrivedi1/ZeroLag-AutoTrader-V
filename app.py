@@ -1,6 +1,7 @@
 import os
 import time
 import secrets
+import logging
 from urllib.parse import urlencode
 
 import requests
@@ -8,11 +9,15 @@ from flask import Flask, jsonify, redirect, request
 
 app = Flask(__name__)
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("zerolag")
+
 TS_CLIENT_ID = os.getenv("TS_CLIENT_ID", "").strip()
 TS_CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET", "").strip()
 TS_REDIRECT_URI = os.getenv("TS_REDIRECT_URI", "").strip()
 TS_API_BASE_URL = os.getenv("TS_API_BASE_URL", "https://sim-api.tradestation.com/v3").rstrip("/")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "NO").strip().upper()
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
 TS_TOKEN_URL = "https://signin.tradestation.com/oauth/token"
@@ -20,12 +25,19 @@ TS_AUDIENCE = "https://api.tradestation.com"
 TS_SCOPES = "openid profile offline_access MarketData ReadAccount Trade"
 
 oauth_state = None
+
 token_store = {
     "access_token": None,
     "refresh_token": None,
     "expires_at": 0,
     "scope": None,
     "token_type": None,
+}
+
+last_webhook = {
+    "received": False,
+    "payload": None,
+    "received_at": None,
 }
 
 def missing_config():
@@ -36,6 +48,8 @@ def missing_config():
         missing.append("TS_CLIENT_SECRET")
     if not TS_REDIRECT_URI:
         missing.append("TS_REDIRECT_URI")
+    if not WEBHOOK_TOKEN:
+        missing.append("WEBHOOK_TOKEN")
     return missing
 
 def save_token_response(data):
@@ -97,9 +111,10 @@ def home():
     return jsonify({
         "service": "ZeroLag AutoTrader",
         "status": "running",
-        "mode": "SIM AUTHENTICATION TEST",
+        "mode": "SIM AUTH + WEBHOOK DRY RUN",
         "trading_enabled": TRADING_ENABLED,
-        "orders_available": False
+        "orders_available": False,
+        "webhook_test_available": True,
     })
 
 @app.get("/health")
@@ -108,7 +123,9 @@ def health():
         "ok": True,
         "service": "ZeroLag AutoTrader",
         "trading_enabled": TRADING_ENABLED,
-        "api_base": TS_API_BASE_URL
+        "orders_available": False,
+        "webhook_test_available": True,
+        "api_base": TS_API_BASE_URL,
     })
 
 @app.get("/auth-status")
@@ -122,7 +139,7 @@ def auth_status():
         "trading_enabled": TRADING_ENABLED,
         "orders_available": False,
         "api_base": TS_API_BASE_URL,
-        "redirect_uri": TS_REDIRECT_URI
+        "redirect_uri": TS_REDIRECT_URI,
     })
 
 @app.get("/login")
@@ -134,11 +151,10 @@ def login():
         return jsonify({
             "ok": False,
             "error": "Missing Render environment variables",
-            "missing": missing
+            "missing": missing,
         }), 500
 
     oauth_state = secrets.token_urlsafe(32)
-
     params = {
         "response_type": "code",
         "client_id": TS_CLIENT_ID,
@@ -160,7 +176,7 @@ def auth_callback():
         return jsonify({
             "ok": False,
             "error": error,
-            "error_description": request.args.get("error_description", "")
+            "error_description": request.args.get("error_description", ""),
         }), 400
 
     code = request.args.get("code")
@@ -169,13 +185,13 @@ def auth_callback():
     if not code:
         return jsonify({
             "ok": False,
-            "error": "No authorization code was returned by TradeStation."
+            "error": "No authorization code was returned by TradeStation.",
         }), 400
 
     if not oauth_state or returned_state != oauth_state:
         return jsonify({
             "ok": False,
-            "error": "OAuth state check failed. Please restart at /login."
+            "error": "OAuth state check failed. Please restart at /login.",
         }), 400
 
     payload = {
@@ -196,7 +212,7 @@ def auth_callback():
     except requests.RequestException as exc:
         return jsonify({
             "ok": False,
-            "error": f"Token request failed: {exc}"
+            "error": f"Token request failed: {exc}",
         }), 502
 
     oauth_state = None
@@ -206,7 +222,7 @@ def auth_callback():
             "ok": False,
             "error": "TradeStation token exchange failed",
             "status_code": response.status_code,
-            "details": response.text[:1000]
+            "details": response.text[:1000],
         }), response.status_code
 
     data = response.json()
@@ -214,7 +230,7 @@ def auth_callback():
     if not data.get("access_token"):
         return jsonify({
             "ok": False,
-            "error": "TradeStation response did not contain an access token."
+            "error": "TradeStation response did not contain an access token.",
         }), 502
 
     save_token_response(data)
@@ -225,8 +241,8 @@ def auth_callback():
       <body style="font-family:Arial,sans-serif;margin:40px;">
         <h2>TradeStation authentication successful.</h2>
         <p>Render received an access token successfully.</p>
-        <p><strong>Trading remains disabled.</strong> This application has no order-placement route.</p>
-        <p><a href="/account-test">Click here to test the TradeStation SIM account connection</a></p>
+        <p><strong>Trading remains disabled.</strong></p>
+        <p><a href="/account-test">Test TradeStation SIM account connection</a></p>
         <p><a href="/auth-status">View authentication status</a></p>
       </body>
     </html>
@@ -235,11 +251,12 @@ def auth_callback():
 @app.get("/account-test")
 def account_test():
     access_token, error = get_valid_access_token()
+
     if not access_token:
         return jsonify({
             "ok": False,
             "error": error,
-            "next_step": "Open /login"
+            "next_step": "Open /login",
         }), 401
 
     url = f"{TS_API_BASE_URL}/brokerage/accounts"
@@ -253,7 +270,7 @@ def account_test():
     except requests.RequestException as exc:
         return jsonify({
             "ok": False,
-            "error": f"Account request failed: {exc}"
+            "error": f"Account request failed: {exc}",
         }), 502
 
     try:
@@ -266,7 +283,7 @@ def account_test():
             "ok": False,
             "status_code": response.status_code,
             "endpoint": "/brokerage/accounts",
-            "response": body
+            "response": body,
         }), response.status_code
 
     return jsonify({
@@ -274,17 +291,80 @@ def account_test():
         "environment": "SIM" if "sim-api" in TS_API_BASE_URL else "UNKNOWN",
         "trading_enabled": TRADING_ENABLED,
         "orders_available": False,
-        "tradestation_response": body
+        "tradestation_response": body,
     })
 
-@app.post("/webhook")
-def webhook_disabled():
+@app.post("/webhook/<token>")
+def webhook_test(token):
+    if not WEBHOOK_TOKEN or token != WEBHOOK_TOKEN:
+        log.warning("Rejected webhook: invalid token")
+        return jsonify({
+            "ok": False,
+            "error": "Unauthorized webhook token",
+        }), 401
+
+    if not request.is_json:
+        return jsonify({
+            "ok": False,
+            "error": "JSON body required",
+        }), 400
+
+    payload = request.get_json(silent=True) or {}
+
+    action = str(payload.get("action", "")).upper().strip()
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    strategy_name = str(payload.get("strategy", "")).strip()
+    size = payload.get("size")
+
+    if action not in {"BUY", "SELL"}:
+        return jsonify({
+            "ok": False,
+            "error": "action must be BUY or SELL",
+        }), 400
+
+    if not symbol:
+        return jsonify({
+            "ok": False,
+            "error": "symbol is required",
+        }), 400
+
+    last_webhook["received"] = True
+    last_webhook["payload"] = payload
+    last_webhook["received_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    log.info(
+        "WEBHOOK DRY RUN | strategy=%s action=%s symbol=%s size=%s",
+        strategy_name,
+        action,
+        symbol,
+        size,
+    )
+
     return jsonify({
-        "ok": False,
-        "message": "Webhook trading is disabled during TradeStation API integration.",
+        "ok": True,
+        "received": True,
+        "dry_run": True,
         "trading_enabled": TRADING_ENABLED,
-        "orders_available": False
-    }), 503
+        "orders_available": False,
+        "message": "TradingView webhook received successfully. No TradeStation order was sent.",
+        "parsed": {
+            "strategy": strategy_name,
+            "action": action,
+            "symbol": symbol,
+            "size": size,
+        },
+    }), 200
+
+@app.get("/webhook-status")
+def webhook_status():
+    return jsonify({
+        "ok": True,
+        "last_webhook_received": last_webhook["received"],
+        "received_at": last_webhook["received_at"],
+        "payload": last_webhook["payload"],
+        "trading_enabled": TRADING_ENABLED,
+        "orders_available": False,
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
