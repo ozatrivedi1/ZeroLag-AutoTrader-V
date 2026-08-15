@@ -2,10 +2,14 @@ import os
 import time
 import secrets
 import logging
+import csv
+import threading
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
 import requests
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, redirect, request, send_file
 
 app = Flask(__name__)
 
@@ -29,6 +33,34 @@ ALLOWED_SYMBOL = "SOXL"
 MAX_TEST_QTY = 1
 DUPLICATE_WINDOW_SECONDS = 20
 
+
+# ==============================================================
+# EXECUTION JOURNAL SETTINGS
+# ==============================================================
+
+# Default storage works immediately. For long-term persistence on Render,
+# point JOURNAL_DIR to a mounted persistent disk later.
+JOURNAL_DIR = os.getenv("JOURNAL_DIR", "/tmp/zerolag_journal").strip()
+TV_TIMEFRAME = os.getenv("TV_TIMEFRAME", "5m").strip()
+ET = ZoneInfo("America/New_York")
+
+TV_CSV_PATH = os.path.join(JOURNAL_DIR, "TV_Signals.csv")
+TS_CSV_PATH = os.path.join(JOURNAL_DIR, "TS_Executions.csv")
+
+TV_HEADERS = [
+    "Date", "TV Time", "Symbol", "Action", "TV Price",
+    "Qty", "Strategy", "Time Frame", "Alert Status",
+]
+
+TS_HEADERS = [
+    "Symbol", "Qty", "AvgPrice", "OpenPL", "Pos", "Action",
+    "FillQty", "FillPrice", "OrdState", "TradePL", "DayPL",
+    "Last", "Bid", "Ask", "Net%", "VTot", "Dollar_Vol",
+    "RS_Volume_Ratio", "VWAP", "Int",
+]
+
+journal_lock = threading.Lock()
+
 oauth_state = None
 token_store = {
     "access_token": None,
@@ -37,6 +69,159 @@ token_store = {
 }
 last_webhook = {"received": False, "payload": None, "received_at": None}
 last_signal = {"key": None, "time": 0}
+
+
+def ensure_journal_files():
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    for path, headers in [(TV_CSV_PATH, TV_HEADERS), (TS_CSV_PATH, TS_HEADERS)]:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(headers)
+
+def append_csv(path, headers, row):
+    try:
+        ensure_journal_files()
+        with journal_lock:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writerow({h: row.get(h, "") for h in headers})
+        return True
+    except Exception as exc:
+        log.exception("JOURNAL WRITE FAILED | path=%s | error=%s", path, exc)
+        return False
+
+def now_et():
+    return datetime.now(ET)
+
+def normalize_tv_time(payload):
+    raw = payload.get("tv_time") or payload.get("time") or payload.get("timestamp")
+    if raw:
+        return str(raw)
+    return now_et().strftime("%H:%M:%S")
+
+def journal_tv_signal(payload, action, symbol, strategy_name):
+    dt = now_et()
+    row = {
+        "Date": dt.strftime("%Y-%m-%d"),
+        "TV Time": normalize_tv_time(payload),
+        "Symbol": symbol,
+        "Action": action,
+        "TV Price": payload.get("price", ""),
+        "Qty": payload.get("qty", payload.get("size", "")),
+        "Strategy": strategy_name,
+        "Time Frame": payload.get("timeframe", payload.get("interval", TV_TIMEFRAME)),
+        "Alert Status": "RECEIVED",
+    }
+    append_csv(TV_CSV_PATH, TV_HEADERS, row)
+
+def extract_first_position(body):
+    if not isinstance(body, dict):
+        return None
+    positions = body.get("Positions", [])
+    if not isinstance(positions, list):
+        return None
+    for position in positions:
+        if str(position.get("Symbol", "")).upper().strip() == ALLOWED_SYMBOL:
+            return position
+    return None
+
+def extract_order_id(order_response):
+    if not isinstance(order_response, dict):
+        return None
+    orders = order_response.get("Orders", [])
+    if isinstance(orders, list) and orders and isinstance(orders[0], dict):
+        value = orders[0].get("OrderID") or orders[0].get("OrderId")
+        if value is not None:
+            return str(value)
+    return None
+
+def fetch_order_details(access_token, order_id):
+    if not order_id:
+        return None
+    url = f"{TS_API_BASE_URL}/brokerage/accounts/{TS_SIM_ACCOUNT_ID}/orders"
+    try:
+        response = requests.get(url, headers=ts_headers(access_token), timeout=20)
+    except requests.RequestException as exc:
+        log.warning("ORDER JOURNAL QUERY FAILED | %s", exc)
+        return None
+    if not response.ok:
+        log.warning("ORDER JOURNAL QUERY FAILED | status=%s body=%s",
+                    response.status_code, response.text[:500])
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    orders = body.get("Orders", []) if isinstance(body, dict) else []
+    if not isinstance(orders, list):
+        return None
+    for order in orders:
+        candidate = str(order.get("OrderID") or order.get("OrderId") or "")
+        if candidate == str(order_id):
+            return order
+    return None
+
+def journal_ts_execution_background(access_token, action, order_response):
+    try:
+        time.sleep(1.25)
+        order_id = extract_order_id(order_response)
+        order_detail = fetch_order_details(access_token, order_id)
+        pos_ok, position_qty, position_body = get_soxl_position(access_token)
+        position = extract_first_position(position_body) if pos_ok else None
+
+        qty = position_qty if pos_ok else ""
+        avg_price = ""
+        open_pl = ""
+        pos_text = ""
+
+        if position:
+            avg_price = position.get("AveragePrice") or position.get("AvgPrice") or ""
+            open_pl = position.get("UnrealizedProfitLoss") or position.get("OpenPL") or ""
+
+        if pos_ok:
+            pos_text = "LONG" if position_qty > 0 else ("SHORT" if position_qty < 0 else "FLAT")
+
+        fill_qty = MAX_TEST_QTY
+        fill_price = ""
+        order_state = "SENT"
+
+        if order_detail:
+            fill_qty = order_detail.get("FilledQuantity") or order_detail.get("Quantity") or MAX_TEST_QTY
+            fill_price = order_detail.get("FilledPrice") or order_detail.get("AverageFilledPrice") or ""
+            order_state = order_detail.get("Status") or order_detail.get("State") or order_detail.get("OrderStatus") or "SENT"
+
+        if not fill_price and action == "BUY" and avg_price:
+            fill_price = avg_price
+
+        row = {
+            "Symbol": ALLOWED_SYMBOL,
+            "Qty": qty,
+            "AvgPrice": avg_price,
+            "OpenPL": open_pl,
+            "Pos": pos_text,
+            "Action": action,
+            "FillQty": fill_qty,
+            "FillPrice": fill_price,
+            "OrdState": order_state,
+            "TradePL": "",
+            "DayPL": "",
+            "Last": "",
+            "Bid": "",
+            "Ask": "",
+            "Net%": "",
+            "VTot": "",
+            "Dollar_Vol": "",
+            "RS_Volume_Ratio": "",
+            "VWAP": "",
+            "Int": TV_TIMEFRAME,
+        }
+        append_csv(TS_CSV_PATH, TS_HEADERS, row)
+        log.info("JOURNAL TS SAVED | action=%s order_id=%s fill_price=%s state=%s",
+                 action, order_id, fill_price, order_state)
+    except Exception as exc:
+        log.exception("TS JOURNAL BACKGROUND ERROR | %s", exc)
+
+ensure_journal_files()
 
 def sim_environment_ok():
     return TS_API_BASE_URL.lower().startswith("https://sim-api.tradestation.com/v3")
@@ -217,6 +402,9 @@ def home():
         "orders_available": order_capability_ready(),
         "allowed_symbol": ALLOWED_SYMBOL,
         "max_test_quantity": MAX_TEST_QTY,
+        "journal_available": True,
+        "tv_csv": "/journal/tv.csv",
+        "ts_csv": "/journal/ts.csv",
     })
 
 @app.get("/health")
@@ -229,6 +417,40 @@ def health():
         "trading_enabled": TRADING_ENABLED,
         "orders_available": order_capability_ready(),
     })
+
+
+@app.get("/journal/status")
+def journal_status():
+    ensure_journal_files()
+
+    def count_rows(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return max(sum(1 for _ in f) - 1, 0)
+        except Exception:
+            return 0
+
+    return jsonify({
+        "ok": True,
+        "journal_dir": JOURNAL_DIR,
+        "tv_rows": count_rows(TV_CSV_PATH),
+        "ts_rows": count_rows(TS_CSV_PATH),
+        "tv_csv": "/journal/tv.csv",
+        "ts_csv": "/journal/ts.csv",
+        "storage_note": "Default /tmp storage is temporary until a Render persistent disk is mounted.",
+    })
+
+@app.get("/journal/tv.csv")
+def download_tv_csv():
+    ensure_journal_files()
+    return send_file(TV_CSV_PATH, mimetype="text/csv",
+                     as_attachment=False, download_name="TV_Signals.csv")
+
+@app.get("/journal/ts.csv")
+def download_ts_csv():
+    ensure_journal_files()
+    return send_file(TS_CSV_PATH, mimetype="text/csv",
+                     as_attachment=False, download_name="TS_Executions.csv")
 
 @app.get("/auth-status")
 def auth_status():
@@ -418,6 +640,8 @@ def webhook(token):
     last_webhook["payload"] = payload
     last_webhook["received_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    journal_tv_signal(payload, action, symbol, strategy_name)
+
     log.info(
         "WEBHOOK | strategy=%s action=%s symbol=%s trading_enabled=%s",
         strategy_name, action, symbol, TRADING_ENABLED
@@ -509,6 +733,12 @@ def webhook(token):
         action, symbol, MAX_TEST_QTY, order_response
     )
 
+    threading.Thread(
+        target=journal_ts_execution_background,
+        args=(access_token, action, order_response),
+        daemon=True,
+    ).start()
+
     return jsonify({
         "ok": True,
         "received": True,
@@ -519,6 +749,7 @@ def webhook(token):
         "action": action,
         "quantity": MAX_TEST_QTY,
         "tradestation_response": order_response,
+        "journal": "queued",
     }), 200
 
 @app.get("/webhook-status")
