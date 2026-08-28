@@ -25,7 +25,23 @@ TS_API_BASE_URL = os.getenv(
 ).rstrip("/")
 TS_LIVE_API_BASE_URL = "https://api.tradestation.com/v3"
 TS_SIM_ACCOUNT_ID = os.getenv("TS_SIM_ACCOUNT_ID", "").strip()
+TS_LIVE_ACCOUNT_ID = os.getenv("TS_LIVE_ACCOUNT_ID", "").strip()
+
+# Master switch used by the existing service. Keep YES only when execution is intended.
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "NO").strip().upper()
+
+# SOXL Regular can be routed independently. Default remains SIM.
+SOXL_REGULAR_EXECUTION_MODE = os.getenv(
+    "SOXL_REGULAR_EXECUTION_MODE",
+    "SIM"
+).strip().upper()
+
+# Second, independent gate required before any LIVE order can be sent.
+LIVE_TRADING_ENABLED = os.getenv(
+    "LIVE_TRADING_ENABLED",
+    "NO"
+).strip().upper()
+
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
@@ -45,6 +61,7 @@ ALLOWED_STRATEGIES = {
 }
 
 MAX_TEST_QTY = 1
+LIVE_MAX_QTY = 1
 DUPLICATE_WINDOW_SECONDS = 20
 
 
@@ -600,6 +617,32 @@ def missing_config():
     return missing
 
 
+def live_regular_mode_selected():
+    return SOXL_REGULAR_EXECUTION_MODE == "LIVE"
+
+
+def live_order_capability_ready():
+    return bool(
+        TS_CLIENT_ID
+        and TS_CLIENT_SECRET
+        and TS_REDIRECT_URI
+        and TS_LIVE_ACCOUNT_ID
+        and WEBHOOK_TOKEN
+        and LIVE_MAX_QTY == 1
+    )
+
+
+def live_regular_session_now():
+    dt = now_et()
+
+    # Monday=0 ... Sunday=6
+    if dt.weekday() > 4:
+        return False
+
+    minutes = dt.hour * 60 + dt.minute
+    return (9 * 60 + 30) <= minutes < (16 * 60)
+
+
 # ==============================================================
 # OAUTH
 # ==============================================================
@@ -961,6 +1004,197 @@ def submit_sim_market_order(
 
 
 # ==============================================================
+# LIVE POSITION / CONFIRM / ORDER HELPERS
+# ==============================================================
+
+def get_soxl_live_position(access_token):
+    if not TS_LIVE_ACCOUNT_ID:
+        return (
+            False,
+            None,
+            {"error": "TS_LIVE_ACCOUNT_ID is missing."}
+        )
+
+    url = (
+        f"{TS_LIVE_API_BASE_URL}"
+        f"/brokerage/accounts/"
+        f"{TS_LIVE_ACCOUNT_ID}"
+        f"/positions"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            None,
+            {"error": f"LIVE position request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            None,
+            {
+                "status_code": response.status_code,
+                "response": body
+            }
+        )
+
+    positions = (
+        body.get("Positions", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(positions, list):
+        positions = []
+
+    for position in positions:
+        symbol = str(position.get("Symbol", "")).upper().strip()
+        if symbol == ALLOWED_SYMBOL:
+            raw_qty = (
+                position.get("Quantity")
+                or position.get("LongQuantity")
+                or 0
+            )
+            try:
+                quantity = float(raw_qty)
+            except (TypeError, ValueError):
+                quantity = 0.0
+
+            return (True, quantity, body)
+
+    return (True, 0.0, body)
+
+
+def build_live_market_order(action):
+    return {
+        "AccountID": TS_LIVE_ACCOUNT_ID,
+        "Symbol": ALLOWED_SYMBOL,
+        "Quantity": str(LIVE_MAX_QTY),
+        "OrderType": "Market",
+        "TradeAction": action,
+        "TimeInForce": {
+            "Duration": "DAY"
+        },
+        "Route": "Intelligent"
+    }
+
+
+def confirm_live_market_order(access_token, action="BUY"):
+    if action not in {"BUY", "SELL"}:
+        return (False, {"error": "action must be BUY or SELL"})
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return (False, {"error": "TS_LIVE_ACCOUNT_ID is missing."})
+
+    url = f"{TS_LIVE_API_BASE_URL}/orderexecution/orderconfirm"
+    order = build_live_market_order(action)
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            {"error": f"LIVE Confirm Order request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            {
+                "status_code": response.status_code,
+                "response": body,
+                "confirmed_order": order
+            }
+        )
+
+    return (True, body)
+
+
+def submit_live_market_order(access_token, action):
+    if action not in {"BUY", "SELL"}:
+        return (False, {"error": "action must be BUY or SELL"})
+
+    if LIVE_TRADING_ENABLED != "YES":
+        return (
+            False,
+            {"error": "Blocked: LIVE_TRADING_ENABLED is not YES."}
+        )
+
+    if not live_regular_mode_selected():
+        return (
+            False,
+            {"error": "Blocked: SOXL_REGULAR_EXECUTION_MODE is not LIVE."}
+        )
+
+    if not live_order_capability_ready():
+        return (
+            False,
+            {"error": "Blocked: LIVE order capability is not ready."}
+        )
+
+    if not live_regular_session_now():
+        return (
+            False,
+            {"error": "Blocked: LIVE Market order is outside 09:30-16:00 ET."}
+        )
+
+    url = f"{TS_LIVE_API_BASE_URL}/orderexecution/orders"
+    order = build_live_market_order(action)
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            {"error": f"LIVE order request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            {
+                "status_code": response.status_code,
+                "response": body,
+                "submitted_order": order
+            }
+        )
+
+    return (True, body)
+
+
+# ==============================================================
 # DUPLICATE SIGNAL PROTECTION
 # ==============================================================
 
@@ -1019,6 +1253,15 @@ def home():
 
         "orders_available":
             order_capability_ready(),
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
 
         "allowed_symbol":
             ALLOWED_SYMBOL,
@@ -1182,6 +1425,21 @@ def auth_status():
 
         "api_base":
             TS_API_BASE_URL,
+
+        "live_api_base":
+            TS_LIVE_API_BASE_URL,
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_account_configured":
+            bool(TS_LIVE_ACCOUNT_ID),
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
 
         "redirect_uri":
             TS_REDIRECT_URI,
@@ -1397,6 +1655,8 @@ def auth_callback():
     <p><strong>Trading remains controlled by TRADING_ENABLED.</strong></p>
     <p><a href="/account-test">Test TradeStation SIM account connection</a></p>
     <p><a href="/live-account-test">Test TradeStation LIVE accounts - READ ONLY</a></p>
+    <p><a href="/live-position-test">Test SOXL LIVE position - READ ONLY</a></p>
+    <p><a href="/live-confirm-buy-test">Confirm 1-share SOXL LIVE BUY - NO ORDER</a></p>
     <p><a href="/position-test">Test SOXL SIM position</a></p>
     <p><a href="/auth-status">View authentication status</a></p>
     </body>
@@ -1565,6 +1825,101 @@ def live_account_test():
             "This route cannot place an order."
         ),
         "tradestation_response": body
+    })
+
+
+# ==============================================================
+# LIVE POSITION TEST - READ ONLY
+# ==============================================================
+
+@app.get("/live-position-test")
+def live_position_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "TS_LIVE_ACCOUNT_ID is not configured in Render.",
+            "live_order_submission_enabled": False
+        }), 503
+
+    ok, quantity, body = get_soxl_live_position(access_token)
+
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "LIVE SOXL position query failed.",
+            "details": body
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "environment": "LIVE",
+        "symbol": ALLOWED_SYMBOL,
+        "quantity": quantity,
+        "is_long": quantity > 0,
+        "live_order_submission_enabled": (
+            LIVE_TRADING_ENABLED == "YES"
+            and live_regular_mode_selected()
+        )
+    })
+
+
+# ==============================================================
+# LIVE CONFIRM ORDER TEST - NO ORDER IS PLACED
+# ==============================================================
+
+@app.get("/live-confirm-buy-test")
+def live_confirm_buy_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "TS_LIVE_ACCOUNT_ID is not configured in Render.",
+            "order_sent": False
+        }), 503
+
+    ok, body = confirm_live_market_order(access_token, "BUY")
+
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "order_sent": False,
+            "error": "TradeStation Confirm Order failed.",
+            "details": body
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "environment": "LIVE",
+        "symbol": ALLOWED_SYMBOL,
+        "quantity": LIVE_MAX_QTY,
+        "action": "BUY",
+        "order_sent": False,
+        "message": (
+            "TradeStation Confirm Order succeeded. "
+            "No LIVE order was placed."
+        ),
+        "tradestation_confirmation": body
     })
 
 
@@ -1855,6 +2210,206 @@ def webhook(token):
                 "Webhook received. "
                 "Trading is disabled; "
                 "no TradeStation order was sent.",
+        }), 200
+
+
+    # ----------------------------------------------------------
+    # SOXL REGULAR LIVE ROUTE
+    #
+    # LIVE execution requires ALL of these:
+    #   1) strategy == SOXL_REGULAR
+    #   2) SOXL_REGULAR_EXECUTION_MODE == LIVE
+    #   3) TRADING_ENABLED == YES
+    #   4) LIVE_TRADING_ENABLED == YES
+    #   5) LIVE account configured
+    #   6) 09:30-16:00 ET weekday
+    #   7) SOXL position is either FLAT or exactly LONG 1
+    #
+    # SOXL_OVERNIGHT never enters this LIVE route.
+    # ----------------------------------------------------------
+
+    if (
+        strategy_name == "SOXL_REGULAR"
+        and live_regular_mode_selected()
+    ):
+        if LIVE_TRADING_ENABLED != "YES":
+            return jsonify({
+                "ok": True,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "live_gate_open": False,
+                "message": (
+                    "SOXL Regular is selected for LIVE, "
+                    "but LIVE_TRADING_ENABLED is not YES. "
+                    "No LIVE order was sent."
+                )
+            }), 200
+
+        if not live_order_capability_ready():
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "error": "LIVE order capability is not ready.",
+                "live_account_configured": bool(TS_LIVE_ACCOUNT_ID)
+            }), 503
+
+        if not live_regular_session_now():
+            return jsonify({
+                "ok": True,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "message": (
+                    "LIVE order blocked outside "
+                    "09:30-16:00 ET regular session."
+                )
+            }), 200
+
+        if duplicate_signal(
+            action,
+            symbol,
+            strategy_name
+        ):
+            return jsonify({
+                "ok": True,
+                "received": True,
+                "duplicate_blocked": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "message": "Duplicate LIVE signal blocked."
+            }), 200
+
+        access_token, error = get_valid_access_token()
+
+        if not access_token:
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "error": "TradeStation authentication is required.",
+                "details": error,
+                "next_step": "Open /login"
+            }), 401
+
+        pos_ok, position_qty, pos_body = (
+            get_soxl_live_position(access_token)
+        )
+
+        if not pos_ok:
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "error": (
+                    "LIVE position verification failed. "
+                    "Order blocked."
+                ),
+                "details": pos_body
+            }), 502
+
+        # For the initial LIVE phase, do not touch an unexpected
+        # SOXL position. Only FLAT or exactly LONG 1 is permitted.
+        if position_qty not in {0.0, 1.0}:
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "error": (
+                    "LIVE safety block: SOXL position must be "
+                    "FLAT or exactly LONG 1."
+                ),
+                "position_quantity": position_qty
+            }), 409
+
+        if action == "BUY" and position_qty > 0:
+            log.info(
+                "LIVE BUY BLOCKED | strategy=%s symbol=%s "
+                "existing_position=%s",
+                strategy_name,
+                symbol,
+                position_qty
+            )
+
+            return jsonify({
+                "ok": True,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "message": (
+                    "LIVE BUY blocked: SOXL is already LONG 1."
+                ),
+                "position_quantity": position_qty
+            }), 200
+
+        if action == "SELL" and position_qty <= 0:
+            log.info(
+                "LIVE SELL BLOCKED | strategy=%s symbol=%s "
+                "existing_position=%s",
+                strategy_name,
+                symbol,
+                position_qty
+            )
+
+            return jsonify({
+                "ok": True,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "message": (
+                    "LIVE SELL blocked: account is already flat."
+                ),
+                "position_quantity": position_qty
+            }), 200
+
+        order_ok, order_response = submit_live_market_order(
+            access_token,
+            action
+        )
+
+        if not order_ok:
+            log.error(
+                "LIVE ORDER FAILED | action=%s symbol=%s response=%s",
+                action,
+                symbol,
+                order_response
+            )
+
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "environment": "LIVE",
+                "error": "TradeStation LIVE order submission failed.",
+                "details": order_response
+            }), 502
+
+        log.warning(
+            "LIVE ORDER SENT | strategy=%s action=%s "
+            "symbol=%s qty=%s response=%s",
+            strategy_name,
+            action,
+            symbol,
+            LIVE_MAX_QTY,
+            order_response
+        )
+
+        return jsonify({
+            "ok": True,
+            "received": True,
+            "dry_run": False,
+            "order_sent": True,
+            "environment": "LIVE",
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "action": action,
+            "quantity": LIVE_MAX_QTY,
+            "tradestation_response": order_response
         }), 200
 
 
@@ -2191,6 +2746,15 @@ def webhook_status():
 
         "orders_available":
             order_capability_ready(),
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
     })
 
 
