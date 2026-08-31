@@ -803,13 +803,17 @@ def odts_option_test():
 
         response.close()
 
-        return jsonify({
-            "ok": False,
-            "read_only": True,
-            "order_sent": False,
-            "symbol": symbol,
-            "error": "No quote data was returned."
-        }), 502
+      return jsonify({
+    "ok": True,
+    "read_only": True,
+    "order_sent": False,
+    "symbol": symbol,
+    "bid": quote.get("Bid", ""),
+    "ask": quote.get("Ask", ""),
+    "last": quote.get("Last", ""),
+    "volume": quote.get("Volume", ""),
+    "open_interest": quote.get("DailyOpenInterest", "")
+})
 
     except requests.RequestException as exc:
         return jsonify({
