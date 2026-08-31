@@ -2282,229 +2282,125 @@ def webhook(token):
 
 
     # ----------------------------------------------------------
-    # SOXL LIVE ROUTE - REGULAR + OVERNIGHT
+    # SOXL LIVE ROUTE - REGULAR + OVERNIGHT INDEPENDENT
     #
-    # A strategy enters LIVE only when its own execution mode is LIVE.
-    # Regular and Overnight therefore remain independently controllable.
-    #
-    # Safety rules for BOTH strategies:
-    #   1) TRADING_ENABLED == YES
-    #   2) LIVE_TRADING_ENABLED == YES
-    #   3) strategy-specific execution mode == LIVE
-    #   4) LIVE account configured
-    #   5) order arrives during 09:30-16:00 ET weekday
-    #   6) SOXL position must be FLAT or exactly LONG 1
-    #   7) BUY while LONG is blocked (Overnight inherits Regular long)
-    #   8) SELL while FLAT is blocked
-    #   9) one LIVE position-check/order sequence at a time
+    # Each TradingView strategy owns its own BUY/SELL sequence.
+    # Regular and Overnight may each hold one share simultaneously.
+    # Account-level maximum = 2 SOXL shares.
+    # No BUY inheritance and no cross-strategy handoff.
     # ----------------------------------------------------------
 
     if live_strategy_mode_selected(strategy_name):
         if LIVE_TRADING_ENABLED != "YES":
             return jsonify({
-                "ok": True,
-                "received": True,
-                "order_sent": False,
-                "environment": "LIVE",
-                "strategy": strategy_name,
-                "live_gate_open": False,
-                "message": (
-                    f"{strategy_name} is selected for LIVE, "
-                    "but LIVE_TRADING_ENABLED is not YES. "
-                    "No LIVE order was sent."
-                )
+                "ok": True, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "message": "LIVE_TRADING_ENABLED is not YES; no order sent."
             }), 200
 
         if not live_order_capability_ready():
             return jsonify({
-                "ok": False,
-                "received": True,
-                "order_sent": False,
-                "environment": "LIVE",
-                "strategy": strategy_name,
-                "error": "LIVE order capability is not ready.",
-                "live_account_configured": bool(TS_LIVE_ACCOUNT_ID)
+                "ok": False, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "error": "LIVE order capability is not ready."
             }), 503
 
         if not live_market_session_now():
             return jsonify({
-                "ok": True,
-                "received": True,
-                "order_sent": False,
-                "environment": "LIVE",
-                "strategy": strategy_name,
-                "message": (
-                    "LIVE order blocked outside "
-                    "09:30-16:00 ET regular session. "
-                    "Overnight may hold a position overnight, "
-                    "but this version does not place extended-hours orders."
-                )
+                "ok": True, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "message": "LIVE order blocked outside 09:30-16:00 ET regular session."
             }), 200
 
-        if duplicate_signal(
-            action,
-            symbol,
-            strategy_name
-        ):
+        if duplicate_signal(action, symbol, strategy_name):
             return jsonify({
-                "ok": True,
-                "received": True,
-                "duplicate_blocked": True,
-                "order_sent": False,
-                "environment": "LIVE",
+                "ok": True, "received": True, "duplicate_blocked": True,
+                "order_sent": False, "environment": "LIVE",
                 "strategy": strategy_name,
                 "message": "Duplicate LIVE signal blocked."
             }), 200
 
         access_token, error = get_valid_access_token()
-
         if not access_token:
             return jsonify({
-                "ok": False,
-                "received": True,
-                "order_sent": False,
-                "environment": "LIVE",
-                "strategy": strategy_name,
+                "ok": False, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
                 "error": "TradeStation authentication is required.",
-                "details": error,
-                "next_step": "Open /login"
+                "details": error, "next_step": "Open /login"
             }), 401
 
-        # Serialize the LIVE position check and order submission.
-        # This prevents two simultaneous webhooks from both seeing FLAT.
+        # Serialize account check + order submission so simultaneous
+        # Regular/Overnight signals cannot race each other.
         with live_order_lock:
-            pos_ok, position_qty, pos_body = (
-                get_soxl_live_position(access_token)
-            )
+            pos_ok, position_qty, pos_body = get_soxl_live_position(access_token)
 
             if not pos_ok:
                 return jsonify({
-                    "ok": False,
-                    "received": True,
-                    "order_sent": False,
-                    "environment": "LIVE",
-                    "strategy": strategy_name,
-                    "error": (
-                        "LIVE position verification failed. "
-                        "Order blocked."
-                    ),
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "error": "LIVE position verification failed. Order blocked.",
                     "details": pos_body
                 }), 502
 
-            # Initial LIVE safety: never touch an unexpected position.
-            if position_qty not in {0.0, 1.0}:
+            # Only long-only combined holdings of 0, 1, or 2 are allowed.
+            if position_qty not in {0.0, 1.0, 2.0}:
                 return jsonify({
-                    "ok": False,
-                    "received": True,
-                    "order_sent": False,
-                    "environment": "LIVE",
-                    "strategy": strategy_name,
-                    "error": (
-                        "LIVE safety block: SOXL position must be "
-                        "FLAT or exactly LONG 1."
-                    ),
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "error": "LIVE safety block: SOXL account position must be 0, 1, or 2 shares.",
                     "position_quantity": position_qty
                 }), 409
 
-            if action == "BUY" and position_qty > 0:
-                log.info(
-                    "LIVE BUY BLOCKED/INHERITED | strategy=%s symbol=%s "
-                    "existing_position=%s",
-                    strategy_name,
-                    symbol,
-                    position_qty
-                )
-
-                message = (
-                    "LIVE BUY blocked: SOXL is already LONG 1."
-                )
-                inherited = False
-
-                if strategy_name == "SOXL_OVERNIGHT":
-                    message = (
-                        "SOXL Overnight BUY inherited existing LIVE "
-                        "LONG 1; no second BUY was sent."
-                    )
-                    inherited = True
-
+            # A BUY from either strategy is independent. It is allowed
+            # whenever the combined account has fewer than 2 shares.
+            if action == "BUY" and position_qty >= 2:
                 return jsonify({
-                    "ok": True,
-                    "received": True,
-                    "order_sent": False,
-                    "environment": "LIVE",
-                    "strategy": strategy_name,
-                    "position_inherited": inherited,
-                    "message": message,
+                    "ok": True, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "message": "LIVE BUY blocked: combined SOXL maximum of 2 shares already reached.",
                     "position_quantity": position_qty
                 }), 200
 
+            # A SELL from either strategy closes exactly one share.
+            # TradingView strategy logic remains responsible for pairing
+            # that SELL with the same strategy's preceding BUY.
             if action == "SELL" and position_qty <= 0:
-                log.info(
-                    "LIVE SELL BLOCKED | strategy=%s symbol=%s "
-                    "existing_position=%s",
-                    strategy_name,
-                    symbol,
-                    position_qty
-                )
-
                 return jsonify({
-                    "ok": True,
-                    "received": True,
-                    "order_sent": False,
-                    "environment": "LIVE",
-                    "strategy": strategy_name,
-                    "message": (
-                        "LIVE SELL blocked: account is already flat."
-                    ),
+                    "ok": True, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "message": "LIVE SELL blocked: account is already flat.",
                     "position_quantity": position_qty
                 }), 200
 
             order_ok, order_response = submit_live_market_order(
-                access_token,
-                action,
-                strategy_name
+                access_token, action, strategy_name
             )
 
             if not order_ok:
                 log.error(
-                    "LIVE ORDER FAILED | strategy=%s action=%s "
-                    "symbol=%s response=%s",
-                    strategy_name,
-                    action,
-                    symbol,
-                    order_response
+                    "LIVE ORDER FAILED | strategy=%s action=%s symbol=%s response=%s",
+                    strategy_name, action, symbol, order_response
                 )
-
                 return jsonify({
-                    "ok": False,
-                    "received": True,
-                    "order_sent": False,
-                    "environment": "LIVE",
-                    "strategy": strategy_name,
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
                     "error": "TradeStation LIVE order submission failed.",
                     "details": order_response
                 }), 502
 
             log.warning(
-                "LIVE ORDER SENT | strategy=%s action=%s "
-                "symbol=%s qty=%s response=%s",
-                strategy_name,
-                action,
-                symbol,
-                LIVE_MAX_QTY,
-                order_response
+                "LIVE ORDER SENT | strategy=%s action=%s symbol=%s qty=%s "
+                "account_position_before=%s response=%s",
+                strategy_name, action, symbol, LIVE_MAX_QTY,
+                position_qty, order_response
             )
 
             return jsonify({
-                "ok": True,
-                "received": True,
-                "dry_run": False,
-                "order_sent": True,
-                "environment": "LIVE",
-                "strategy": strategy_name,
-                "symbol": symbol,
-                "action": action,
-                "quantity": LIVE_MAX_QTY,
+                "ok": True, "received": True, "dry_run": False,
+                "order_sent": True, "environment": "LIVE",
+                "strategy": strategy_name, "symbol": symbol,
+                "action": action, "quantity": LIVE_MAX_QTY,
+                "account_position_before": position_qty,
                 "tradestation_response": order_response
             }), 200
 
