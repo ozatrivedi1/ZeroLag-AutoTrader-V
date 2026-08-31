@@ -728,7 +728,97 @@ def refresh_access_token():
         "client_secret": TS_CLIENT_SECRET,
         "refresh_token": refresh_token,
     }
+# ==============================================================
+# ODTS OPTION QUOTE TEST - READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
 
+@app.get("/odts-option-test")
+def odts_option_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    # Temporary test contract:
+    # QQQ Sep 1, 2026 718 Call
+    symbol = "QQQ 260901C718"
+
+    encoded_symbol = requests.utils.quote(
+        symbol,
+        safe=""
+    )
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/quotes/"
+        f"{encoded_symbol}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=20
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "status_code": response.status_code,
+                "symbol": symbol,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            text = line.decode("utf-8").strip()
+
+            try:
+                quote = response.json() if False else None
+                import json
+                quote = json.loads(text)
+            except Exception:
+                quote = {
+                    "raw": text
+                }
+
+            response.close()
+
+            return jsonify({
+                "ok": True,
+                "read_only": True,
+                "order_sent": False,
+                "symbol": symbol,
+                "tradestation_quote": quote
+            })
+
+        response.close()
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": "No quote data was returned."
+        }), 502
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": f"Option quote request failed: {exc}"
+        }), 502
     try:
         response = requests.post(
             TS_TOKEN_URL,
