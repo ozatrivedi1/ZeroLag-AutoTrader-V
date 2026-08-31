@@ -91,7 +91,7 @@ TS_AUDIENCE = (
 
 TS_SCOPES = (
     "openid profile offline_access "
-    "MarketData ReadAccount Trade"
+    "MarketData ReadAccount Trade OptionSpreads"
 )
 
 
