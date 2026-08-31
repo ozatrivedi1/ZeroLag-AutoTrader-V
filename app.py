@@ -3,6 +3,7 @@ import time
 import secrets
 import logging
 import csv
+import json
 import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -1095,7 +1096,8 @@ def ts_headers(
             "application/json",
     }
     # ==============================================================
-# ODTS OPTION QUOTE TEST - READ ONLY / NO ORDER SUBMISSION
+# ODTS OPTION QUOTE + GREEKS TEST
+# READ ONLY / NO ORDER SUBMISSION
 # ==============================================================
 
 @app.get("/odts-option-test")
@@ -1113,21 +1115,22 @@ def odts_option_test():
     # QQQ Sep 1, 2026 718 Call
     symbol = "QQQ 260901C718"
 
-    encoded_symbol = requests.utils.quote(
-        symbol,
-        safe=""
-    )
-
     url = (
         f"{TS_API_BASE_URL}"
-        f"/marketdata/stream/quotes/"
-        f"{encoded_symbol}"
+        f"/marketdata/stream/options/quotes"
     )
+
+    params = {
+        "legs[0].Symbol": symbol,
+        "legs[0].Ratio": 1,
+        "enableGreeks": "true"
+    }
 
     try:
         response = requests.get(
             url,
             headers=ts_headers(access_token),
+            params=params,
             stream=True,
             timeout=20
         )
@@ -1146,11 +1149,15 @@ def odts_option_test():
             if not line:
                 continue
 
-            text = line.decode("utf-8").strip()
+            text = line.decode(
+                "utf-8"
+            ).strip()
 
             try:
-                import json
-                quote = json.loads(text)
+                quote = json.loads(
+                    text
+                )
+
             except Exception:
                 quote = {
                     "raw": text
@@ -1159,37 +1166,126 @@ def odts_option_test():
             response.close()
 
             return jsonify({
-                "ok": True,
-                "read_only": True,
-                "order_sent": False,
-                "symbol": symbol,
-                "bid": quote.get("Bid", ""),
-                "ask": quote.get("Ask", ""),
-                "last": quote.get("Last", ""),
-                "volume": quote.get("Volume", ""),
-                "open_interest": quote.get(
-                    "DailyOpenInterest",
-                    ""
-                )
+                "ok":
+                    True,
+
+                "read_only":
+                    True,
+
+                "order_sent":
+                    False,
+
+                "symbol":
+                    symbol,
+
+                "bid":
+                    quote.get(
+                        "Bid",
+                        ""
+                    ),
+
+                "ask":
+                    quote.get(
+                        "Ask",
+                        ""
+                    ),
+
+                "last":
+                    quote.get(
+                        "Last",
+                        ""
+                    ),
+
+                "volume":
+                    quote.get(
+                        "Volume",
+                        ""
+                    ),
+
+                "open_interest":
+                    quote.get(
+                        "DailyOpenInterest",
+                        ""
+                    ),
+
+                "delta":
+                    quote.get(
+                        "Delta",
+                        ""
+                    ),
+
+                "gamma":
+                    quote.get(
+                        "Gamma",
+                        ""
+                    ),
+
+                "theta":
+                    quote.get(
+                        "Theta",
+                        ""
+                    ),
+
+                "vega":
+                    quote.get(
+                        "Vega",
+                        ""
+                    ),
+
+                "implied_volatility":
+                    quote.get(
+                        "ImpliedVolatility",
+                        ""
+                    ),
+
+                "probability_itm":
+                    quote.get(
+                        "ProbabilityITM",
+                        ""
+                    ),
+
+                "probability_otm":
+                    quote.get(
+                        "ProbabilityOTM",
+                        ""
+                    )
             })
 
         response.close()
 
         return jsonify({
-            "ok": False,
-            "read_only": True,
-            "order_sent": False,
-            "symbol": symbol,
-            "error": "No quote data was returned."
+            "ok":
+                False,
+
+            "read_only":
+                True,
+
+            "order_sent":
+                False,
+
+            "symbol":
+                symbol,
+
+            "error":
+                "No option quote data was returned."
         }), 502
 
     except requests.RequestException as exc:
         return jsonify({
-            "ok": False,
-            "read_only": True,
-            "order_sent": False,
-            "symbol": symbol,
-            "error": f"Option quote request failed: {exc}"
+            "ok":
+                False,
+
+            "read_only":
+                True,
+
+            "order_sent":
+                False,
+
+            "symbol":
+                symbol,
+
+            "error":
+                f"Option quote request failed: {exc}"
         }), 502
 
 
@@ -1222,7 +1318,7 @@ def get_soxl_position(
             None,
             {
                 "error":
-                f"Position request failed: {exc}"
+                    f"Position request failed: {exc}"
             }
         )
 
@@ -1232,7 +1328,7 @@ def get_soxl_position(
     except ValueError:
         body = {
             "raw_response":
-            response.text[:1500]
+                response.text[:1500]
         }
 
     if not response.ok:
@@ -1242,14 +1338,21 @@ def get_soxl_position(
             {
                 "status_code":
                     response.status_code,
+
                 "response":
                     body
             }
         )
 
     positions = (
-        body.get("Positions", [])
-        if isinstance(body, dict)
+        body.get(
+            "Positions",
+            []
+        )
+        if isinstance(
+            body,
+            dict
+        )
         else []
     )
 
@@ -1319,8 +1422,8 @@ def submit_sim_market_order(
             False,
             {
                 "error":
-                "Blocked: API base URL "
-                "is not TradeStation SIM."
+                    "Blocked: API base URL "
+                    "is not TradeStation SIM."
             }
         )
 
@@ -1329,8 +1432,8 @@ def submit_sim_market_order(
             False,
             {
                 "error":
-                "Blocked: TS_SIM_ACCOUNT_ID "
-                "is missing."
+                    "Blocked: TS_SIM_ACCOUNT_ID "
+                    "is missing."
             }
         )
 
@@ -1342,16 +1445,24 @@ def submit_sim_market_order(
     order = {
         "AccountID":
             TS_SIM_ACCOUNT_ID,
+
         "Symbol":
             ALLOWED_SYMBOL,
+
         "Quantity":
-            str(MAX_TEST_QTY),
+            str(
+                MAX_TEST_QTY
+            ),
+
         "OrderType":
             "Market",
+
         "TradeAction":
             action,
+
         "TimeInForce": {
-            "Duration": "DAY"
+            "Duration":
+                "DAY"
         },
     }
 
@@ -1370,7 +1481,7 @@ def submit_sim_market_order(
             False,
             {
                 "error":
-                f"Order request failed: {exc}"
+                    f"Order request failed: {exc}"
             }
         )
 
@@ -1380,7 +1491,7 @@ def submit_sim_market_order(
     except ValueError:
         body = {
             "raw_response":
-            response.text[:1500]
+                response.text[:1500]
         }
 
     if not response.ok:
@@ -1389,8 +1500,10 @@ def submit_sim_market_order(
             {
                 "status_code":
                     response.status_code,
+
                 "response":
                     body,
+
                 "submitted_order":
                     order,
             }
@@ -1406,12 +1519,17 @@ def submit_sim_market_order(
 # LIVE POSITION / CONFIRM / ORDER HELPERS
 # ==============================================================
 
-def get_soxl_live_position(access_token):
+def get_soxl_live_position(
+    access_token
+):
     if not TS_LIVE_ACCOUNT_ID:
         return (
             False,
             None,
-            {"error": "TS_LIVE_ACCOUNT_ID is missing."}
+            {
+                "error":
+                    "TS_LIVE_ACCOUNT_ID is missing."
+            }
         )
 
     url = (
@@ -1424,7 +1542,9 @@ def get_soxl_live_position(access_token):
     try:
         response = requests.get(
             url,
-            headers=ts_headers(access_token),
+            headers=ts_headers(
+                access_token
+            ),
             timeout=20
         )
 
@@ -1432,7 +1552,10 @@ def get_soxl_live_position(access_token):
         return (
             False,
             None,
-            {"error": f"LIVE position request failed: {exc}"}
+            {
+                "error":
+                    f"LIVE position request failed: {exc}"
+            }
         )
 
     try:
@@ -1451,14 +1574,21 @@ def get_soxl_live_position(access_token):
             {
                 "status_code":
                     response.status_code,
+
                 "response":
                     body
             }
         )
 
     positions = (
-        body.get("Positions", [])
-        if isinstance(body, dict)
+        body.get(
+            "Positions",
+            []
+        )
+        if isinstance(
+            body,
+            dict
+        )
         else []
     )
 
@@ -1469,17 +1599,25 @@ def get_soxl_live_position(access_token):
         positions = []
 
     for position in positions:
-        symbol = str(
-            position.get(
-                "Symbol",
-                ""
+        symbol = (
+            str(
+                position.get(
+                    "Symbol",
+                    ""
+                )
             )
-        ).upper().strip()
+            .upper()
+            .strip()
+        )
 
         if symbol == ALLOWED_SYMBOL:
             raw_qty = (
-                position.get("Quantity")
-                or position.get("LongQuantity")
+                position.get(
+                    "Quantity"
+                )
+                or position.get(
+                    "LongQuantity"
+                )
                 or 0
             )
 
@@ -1507,7 +1645,9 @@ def get_soxl_live_position(access_token):
     )
 
 
-def build_live_market_order(action):
+def build_live_market_order(
+    action
+):
     return {
         "AccountID":
             TS_LIVE_ACCOUNT_ID,
@@ -1516,7 +1656,9 @@ def build_live_market_order(action):
             ALLOWED_SYMBOL,
 
         "Quantity":
-            str(LIVE_MAX_QTY),
+            str(
+                LIVE_MAX_QTY
+            ),
 
         "OrderType":
             "Market",
@@ -1602,8 +1744,10 @@ def confirm_live_market_order(
             {
                 "status_code":
                     response.status_code,
+
                 "response":
                     body,
+
                 "confirmed_order":
                     order
             }
@@ -1726,8 +1870,10 @@ def submit_live_market_order(
             {
                 "status_code":
                     response.status_code,
+
                 "response":
                     body,
+
                 "submitted_order":
                     order
             }
@@ -1864,7 +2010,9 @@ def health():
 def journal_status():
     ensure_journal_files()
 
-    def count_rows(path):
+    def count_rows(
+        path
+    ):
         try:
             with open(
                 path,
@@ -1872,7 +2020,10 @@ def journal_status():
                 encoding="utf-8"
             ) as f:
                 return max(
-                    sum(1 for _ in f) - 1,
+                    sum(
+                        1
+                        for _ in f
+                    ) - 1,
                     0
                 )
 
@@ -1943,7 +2094,9 @@ def auth_status():
 
     return jsonify({
         "configured":
-            len(missing) == 0,
+            len(
+                missing
+            ) == 0,
 
         "missing_environment_variables":
             missing,
@@ -2099,10 +2252,8 @@ def auth_callback():
         "code"
     )
 
-    returned_state = (
-        request.args.get(
-            "state"
-        )
+    returned_state = request.args.get(
+        "state"
     )
 
     if not code:
@@ -2225,9 +2376,7 @@ def auth_callback():
 
 @app.get("/account-test")
 def account_test():
-    access_token, error = (
-        get_valid_access_token()
-    )
+    access_token, error = get_valid_access_token()
 
     if not access_token:
         return jsonify({
@@ -2600,9 +2749,7 @@ def live_confirm_buy_test():
 
 @app.get("/position-test")
 def position_test():
-    access_token, error = (
-        get_valid_access_token()
-    )
+    access_token, error = get_valid_access_token()
 
     if not access_token:
         return jsonify({
@@ -2776,7 +2923,6 @@ def webhook(token):
 
     # ----------------------------------------------------------
     # STRATEGY SAFETY
-    # ONLY THE TWO CURRENT STRATEGIES MAY TRADE
     # ----------------------------------------------------------
 
     if (
@@ -2883,12 +3029,7 @@ def webhook(token):
 
 
     # ----------------------------------------------------------
-    # SOXL LIVE ROUTE - REGULAR + OVERNIGHT INDEPENDENT
-    #
-    # Each TradingView strategy owns its own BUY/SELL sequence.
-    # Regular and Overnight may each hold one share simultaneously.
-    # Account-level maximum = 2 SOXL shares.
-    # No BUY inheritance and no cross-strategy handoff.
+    # SOXL LIVE ROUTE
     # ----------------------------------------------------------
 
     if live_strategy_mode_selected(
@@ -3025,8 +3166,6 @@ def webhook(token):
             }), 401
 
 
-        # Serialize account check + order submission so simultaneous
-        # Regular/Overnight signals cannot race each other.
         with live_order_lock:
 
             (
@@ -3064,7 +3203,6 @@ def webhook(token):
                 }), 502
 
 
-            # Only long-only combined holdings of 0, 1, or 2 are allowed.
             if position_qty not in {
                 0.0,
                 1.0,
@@ -3095,9 +3233,6 @@ def webhook(token):
                 }), 409
 
 
-            # A BUY from either strategy is independent.
-            # It is allowed whenever the combined account
-            # has fewer than 2 shares.
             if (
                 action == "BUY"
                 and position_qty >= 2
@@ -3127,7 +3262,6 @@ def webhook(token):
                 }), 200
 
 
-            # A SELL from either strategy closes exactly one share.
             if (
                 action == "SELL"
                 and position_qty <= 0
@@ -3362,10 +3496,6 @@ def webhook(token):
 
     # ----------------------------------------------------------
     # REGULAR -> OVERNIGHT HANDOFF
-    #
-    # If a BUY arrives while TS already owns SOXL:
-    # KEEP THE EXISTING POSITION.
-    # DO NOT BUY A SECOND SHARE.
     # ----------------------------------------------------------
 
     if (
@@ -3410,8 +3540,6 @@ def webhook(token):
 
     # ----------------------------------------------------------
     # SELL SAFETY
-    #
-    # NEVER CREATE AN ACCIDENTAL SHORT.
     # ----------------------------------------------------------
 
     if (
