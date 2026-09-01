@@ -924,6 +924,461 @@ def odts_qqq_test():
         }), 502
 
 
+
+# ==============================================================
+# ODTS QQQ 3-MIN INDICATORS TEST
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+def _odts_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _odts_ema(values, length):
+    if not values:
+        return None
+
+    alpha = 2.0 / (length + 1.0)
+    ema_value = float(values[0])
+
+    for value in values[1:]:
+        ema_value = (
+            alpha * float(value)
+            + (1.0 - alpha) * ema_value
+        )
+
+    return ema_value
+
+
+def _odts_wilder(values, length):
+    if len(values) < length:
+        return []
+
+    first = sum(values[:length]) / length
+    result = [None] * (length - 1) + [first]
+    previous = first
+
+    for value in values[length:]:
+        previous = (
+            (previous * (length - 1))
+            + value
+        ) / length
+        result.append(previous)
+
+    return result
+
+
+def _odts_adx(highs, lows, closes, length=14):
+    if len(closes) < (length * 2 + 1):
+        return None
+
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+
+    for i in range(1, len(closes)):
+        high = highs[i]
+        low = lows[i]
+        prev_high = highs[i - 1]
+        prev_low = lows[i - 1]
+        prev_close = closes[i - 1]
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = (
+            up_move
+            if up_move > down_move and up_move > 0
+            else 0.0
+        )
+
+        minus_dm = (
+            down_move
+            if down_move > up_move and down_move > 0
+            else 0.0
+        )
+
+        tr_values.append(tr)
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    atr = _odts_wilder(tr_values, length)
+    plus_dm_smoothed = _odts_wilder(plus_dm_values, length)
+    minus_dm_smoothed = _odts_wilder(minus_dm_values, length)
+
+    dx_values = []
+
+    for i in range(len(tr_values)):
+        if (
+            i >= len(atr)
+            or atr[i] is None
+            or atr[i] == 0
+            or plus_dm_smoothed[i] is None
+            or minus_dm_smoothed[i] is None
+        ):
+            continue
+
+        plus_di = (
+            100.0
+            * plus_dm_smoothed[i]
+            / atr[i]
+        )
+
+        minus_di = (
+            100.0
+            * minus_dm_smoothed[i]
+            / atr[i]
+        )
+
+        denominator = plus_di + minus_di
+
+        if denominator == 0:
+            dx = 0.0
+        else:
+            dx = (
+                100.0
+                * abs(plus_di - minus_di)
+                / denominator
+            )
+
+        dx_values.append(dx)
+
+    if len(dx_values) < length:
+        return None
+
+    adx_series = _odts_wilder(dx_values, length)
+
+    valid = [
+        value
+        for value in adx_series
+        if value is not None
+    ]
+
+    if not valid:
+        return None
+
+    return valid[-1]
+
+
+@app.get("/odts-qqq-indicators-test")
+def odts_qqq_indicators_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    symbol = "QQQ"
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/barcharts/{symbol}"
+    )
+
+    params = {
+        "interval": "3",
+        "unit": "Minute",
+        "barsback": "260",
+        "sessiontemplate": "Default"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params=params,
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                f"QQQ bar request failed: {exc}"
+            )
+        }), 502
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "status_code": response.status_code,
+            "response": response.text[:1000]
+        }), response.status_code
+
+    try:
+        body = response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                "TradeStation bar response "
+                "was not valid JSON."
+            )
+        }), 502
+
+    bars = (
+        body.get("Bars", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(bars, list) or not bars:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": "No QQQ bars were returned."
+        }), 502
+
+    bars = sorted(
+        bars,
+        key=lambda item: int(
+            item.get("Epoch", 0) or 0
+        )
+    )
+
+    closed_bars = []
+
+    for bar in bars:
+        status = str(
+            bar.get("BarStatus", "")
+        ).strip().lower()
+
+        if status and status != "closed":
+            continue
+
+        closed_bars.append(bar)
+
+    if len(closed_bars) < 50:
+        closed_bars = bars
+
+    highs = [
+        _odts_float(bar.get("High"))
+        for bar in closed_bars
+    ]
+
+    lows = [
+        _odts_float(bar.get("Low"))
+        for bar in closed_bars
+    ]
+
+    closes = [
+        _odts_float(bar.get("Close"))
+        for bar in closed_bars
+    ]
+
+    volumes = [
+        _odts_float(bar.get("TotalVolume"))
+        for bar in closed_bars
+    ]
+
+    if len(closes) < 25:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                "Not enough completed 3-minute "
+                "bars were returned."
+            )
+        }), 502
+
+    ema21 = _odts_ema(closes, 21)
+
+    zlema_length = 5
+    lag = int((zlema_length - 1) / 2)
+
+    adjusted = []
+
+    for i, close_value in enumerate(closes):
+        if i < lag:
+            adjusted.append(close_value)
+        else:
+            adjusted.append(
+                close_value
+                + (
+                    close_value
+                    - closes[i - lag]
+                )
+            )
+
+    zlema_series = []
+    alpha = 2.0 / (zlema_length + 1.0)
+    running = adjusted[0]
+    zlema_series.append(running)
+
+    for value in adjusted[1:]:
+        running = (
+            alpha * value
+            + (1.0 - alpha) * running
+        )
+        zlema_series.append(running)
+
+    zlema_state = 0
+
+    if len(zlema_series) >= 2:
+        if zlema_series[-1] > zlema_series[-2]:
+            zlema_state = 1
+        elif zlema_series[-1] < zlema_series[-2]:
+            zlema_state = -1
+
+    confirm_bars = 0
+
+    if zlema_state != 0:
+        for i in range(
+            len(zlema_series) - 1,
+            0,
+            -1
+        ):
+            current_state = 0
+
+            if zlema_series[i] > zlema_series[i - 1]:
+                current_state = 1
+            elif zlema_series[i] < zlema_series[i - 1]:
+                current_state = -1
+
+            if current_state != zlema_state:
+                break
+
+            confirm_bars += 1
+
+            if confirm_bars >= 2:
+                break
+
+    adx14 = _odts_adx(
+        highs,
+        lows,
+        closes,
+        14
+    )
+
+    latest_bar = closed_bars[-1]
+    latest_timestamp = latest_bar.get(
+        "TimeStamp",
+        ""
+    )
+
+    latest_session_date = None
+
+    try:
+        latest_dt = datetime.fromisoformat(
+            latest_timestamp.replace(
+                "Z",
+                "+00:00"
+            )
+        ).astimezone(ET)
+
+        latest_session_date = latest_dt.date()
+    except Exception:
+        latest_session_date = None
+
+    session_pv = 0.0
+    session_volume = 0.0
+
+    for bar, high, low, close_value, volume in zip(
+        closed_bars,
+        highs,
+        lows,
+        closes,
+        volumes
+    ):
+        include_bar = True
+
+        if latest_session_date is not None:
+            try:
+                bar_dt = datetime.fromisoformat(
+                    str(
+                        bar.get(
+                            "TimeStamp",
+                            ""
+                        )
+                    ).replace(
+                        "Z",
+                        "+00:00"
+                    )
+                ).astimezone(ET)
+
+                include_bar = (
+                    bar_dt.date()
+                    == latest_session_date
+                )
+            except Exception:
+                include_bar = False
+
+        if not include_bar:
+            continue
+
+        typical_price = (
+            high
+            + low
+            + close_value
+        ) / 3.0
+
+        session_pv += (
+            typical_price
+            * volume
+        )
+
+        session_volume += volume
+
+    vwap = (
+        session_pv / session_volume
+        if session_volume > 0
+        else None
+    )
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "symbol": symbol,
+        "timeframe": "3 Minute",
+        "bar_timestamp": latest_timestamp,
+        "bars_used": len(closed_bars),
+        "qqq_close": round(closes[-1], 6),
+        "ema21": (
+            round(ema21, 6)
+            if ema21 is not None
+            else ""
+        ),
+        "vwap": (
+            round(vwap, 6)
+            if vwap is not None
+            else ""
+        ),
+        "zlema_state": zlema_state,
+        "zlema_confirm": confirm_bars,
+        "adx14": (
+            round(adx14, 6)
+            if adx14 is not None
+            else ""
+        )
+    })
+
+
 # ==============================================================
 # ODTS OPTION QUOTE + GREEKS TEST
 # READ ONLY / NO ORDER SUBMISSION
