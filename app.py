@@ -2802,6 +2802,146 @@ def odts_exit_framework_test():
         "safety": "Framework loaded. This test endpoint never calls the exit-order function.",
     })
 
+
+# ==============================================================
+# ODTS QQQ EXIT TRIGGER SIMULATOR - READ ONLY V1
+# ==============================================================
+
+@app.get("/odts-exit-trigger-sim-test")
+def odts_exit_trigger_sim_test():
+    """READ-ONLY STOP/TARGET trigger simulator.
+
+    Uses the real SIM position AveragePrice only as a reference, then substitutes
+    a synthetic BID just beyond the selected threshold. It NEVER calls the
+    SELLTOCLOSE function and therefore cannot submit, replace, cancel, or close
+    an order regardless of ODTS_SIM_EXIT_ENABLED.
+
+    Examples:
+      /odts-exit-trigger-sim-test?case=STOP
+      /odts-exit-trigger-sim-test?case=TARGET
+    """
+    case = str(request.args.get("case") or "").strip().upper()
+    if case not in ("STOP", "TARGET"):
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "error": "case must be STOP or TARGET",
+            "examples": [
+                "/odts-exit-trigger-sim-test?case=STOP",
+                "/odts-exit-trigger-sim-test?case=TARGET",
+            ],
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "decision": "WAIT",
+            "message": "No ODTS option symbol is stored yet.",
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "decision": "WAIT",
+            "symbol": symbol,
+        })
+
+    try:
+        avg = float(position.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    try:
+        qty = float(position.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+
+    if avg <= 0 or qty <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "POSITION_DATA_NOT_READY",
+            "decision": "WAIT",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+
+    # Deliberately place the synthetic BID one cent beyond the selected trigger.
+    if case == "STOP":
+        simulated_bid = max(0.01, round(stop_price - 0.01, 2))
+    else:
+        simulated_bid = round(target_price + 0.01, 2)
+
+    if simulated_bid <= stop_price:
+        decision = "EXIT_STOP"
+        reason = "Simulated BID is at or below the -35% stop level."
+    elif simulated_bid >= target_price:
+        decision = "EXIT_TARGET"
+        reason = "Simulated BID is at or above the +50% target level."
+    else:
+        decision = "HOLD"
+        reason = "Simulated BID remains between the stop and target levels."
+
+    pnl_pct = round(((simulated_bid / avg) - 1.0) * 100.0, 2)
+    pnl_dollars = round((simulated_bid - avg) * 100.0 * qty, 2)
+
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "read_only_test": True,
+        "simulation_case": case,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "symbol": symbol,
+        "quantity_contracts": qty,
+        "actual_fill_price_reference": avg,
+        "real_current_bid_ignored": position.get("bid"),
+        "simulated_bid": simulated_bid,
+        "stop_option_price": stop_price,
+        "target_option_price": target_price,
+        "max_loss_pct": 35.0,
+        "profit_target_pct": 50.0,
+        "decision": decision,
+        "reason": reason,
+        "simulated_unrealized_pct": pnl_pct,
+        "simulated_unrealized_dollars": pnl_dollars,
+        "planned_exit_action": "SELLTOCLOSE",
+        "would_trigger_exit_framework": decision in ("EXIT_STOP", "EXIT_TARGET"),
+        "exit_framework_called": False,
+        "exit_order_sent": False,
+        "safety": "SIMULATION ONLY. This endpoint never calls the exit-order function and cannot close the real position.",
+    })
+
+
 # ==============================================================
 # ODTS QQQ POSITION MONITOR / EXIT DECISION - READ ONLY V1
 # ==============================================================
