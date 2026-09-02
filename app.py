@@ -3467,6 +3467,84 @@ def start_odts_continuous_monitor():
     return True
 
 
+
+@app.get("/odts-recovery-test")
+def odts_recovery_test():
+    """
+    READ-ONLY restart-recovery test.
+    It can identify a single eligible QQQ SIM option position after a Render
+    restart, but it NEVER changes odts_last_order and NEVER submits an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    recovered_ok, recovered, recovery_note = (
+        _odts_recover_single_qqq_option_position(access_token)
+    )
+
+    if not recovered_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "recovery_status": recovery_note,
+            "eligible_position": None,
+            "safety": (
+                "Read-only recovery test. No in-memory ODTS state is changed "
+                "and no TradeStation order function is called."
+            )
+        }), 409
+
+    if not recovered:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "recovery_status": recovery_note,
+            "eligible_position": None,
+            "safety": (
+                "No eligible QQQ option position was found. "
+                "No state change and no order submission occurred."
+            )
+        })
+
+    symbol = str(recovered.get("Symbol") or "").strip()
+    asset_type = str(recovered.get("AssetType") or "").strip()
+    long_short = str(recovered.get("LongShort") or "").strip()
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "recovery_status": recovery_note,
+        "eligible_position": {
+            "symbol": symbol,
+            "asset_type": asset_type,
+            "long_short": long_short,
+            "quantity": recovered.get("Quantity"),
+            "average_price": recovered.get("AveragePrice"),
+            "bid": recovered.get("Bid"),
+            "ask": recovered.get("Ask"),
+            "last": recovered.get("Last")
+        },
+        "would_be_recovered_by_continuous_monitor": True,
+        "ODTS_CONTINUOUS_MONITOR_ENABLED": ODTS_CONTINUOUS_MONITOR_ENABLED,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "safety": (
+            "READ ONLY. This endpoint does not modify odts_last_order, does "
+            "not start an exit, and does not call SELLTOCLOSE."
+        )
+    })
+
+
 @app.get("/odts-continuous-monitor-status")
 def odts_continuous_monitor_status():
     return jsonify({
