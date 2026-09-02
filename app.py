@@ -3143,6 +3143,85 @@ def _odts_monitor_update(**kwargs):
         odts_monitor_state.update(kwargs)
 
 
+def _odts_recover_single_qqq_option_position(access_token):
+    """
+    Recover an ODTS candidate after a Render restart.
+
+    Fail-safe rules:
+    - SIM account only.
+    - Long STOCKOPTION only.
+    - Symbol must begin QQQ.
+    - Quantity must be exactly 1.
+    - Recovery succeeds only when exactly ONE eligible position exists.
+      Zero or multiple candidates => no automatic attachment / no exit.
+    """
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/brokerage/accounts/{TS_SIM_ACCOUNT_ID}/positions"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return False, None, f"Recovery position request failed: {exc}"
+
+    if not response.ok:
+        return (
+            False,
+            None,
+            f"Recovery position request failed "
+            f"({response.status_code}): {response.text[:500]}"
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        return False, None, "Recovery position response was not valid JSON."
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        return False, None, "Recovery position response had no Positions list."
+
+    candidates = []
+
+    for raw in positions:
+        if not isinstance(raw, dict):
+            continue
+
+        symbol = str(raw.get("Symbol") or "").strip().upper()
+        asset_type = str(raw.get("AssetType") or "").strip().upper()
+        long_short = str(raw.get("LongShort") or "").strip().upper()
+
+        try:
+            qty = float(raw.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+
+        if (
+            symbol.startswith("QQQ ")
+            and asset_type == "STOCKOPTION"
+            and long_short == "LONG"
+            and qty == 1.0
+        ):
+            candidates.append(raw)
+
+    if len(candidates) == 0:
+        return True, None, "NO_ELIGIBLE_QQQ_OPTION_POSITION"
+
+    if len(candidates) > 1:
+        return (
+            False,
+            None,
+            "MULTIPLE_ELIGIBLE_QQQ_OPTION_POSITIONS - recovery blocked"
+        )
+
+    return True, candidates[0], "RECOVERED_SINGLE_QQQ_OPTION_POSITION"
+
+
 def _odts_continuous_monitor_worker():
     _odts_monitor_update(thread_started=True, running=True, last_status="STARTED")
 
@@ -3169,20 +3248,69 @@ def _odts_continuous_monitor_worker():
 
             symbol = str(odts_last_order.get("symbol") or "").strip()
 
-            # Do not scan the account. Only an option created by this ODTS
-            # process is eligible for automatic monitoring/exiting.
+            # After a Render restart, process memory is empty. Recover only
+            # when the SIM account contains exactly ONE eligible long QQQ
+            # option position of exactly one contract. Ambiguity blocks action.
             if not symbol:
+                access_token, token_error = get_valid_access_token()
+
+                if not access_token:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="AUTH_REQUIRED_FOR_RECOVERY",
+                        last_decision="WAIT",
+                        last_error=token_error
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                recovered_ok, recovered, recovery_note = (
+                    _odts_recover_single_qqq_option_position(access_token)
+                )
+
+                if not recovered_ok:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="RECOVERY_SAFETY_BLOCK",
+                        last_decision="WAIT",
+                        last_error=recovery_note
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                if not recovered:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="NO_ELIGIBLE_QQQ_OPTION_POSITION",
+                        last_decision="WAIT",
+                        last_bid=None,
+                        stop_price=None,
+                        target_price=None,
+                        exit_order_sent=False,
+                        exit_response=None,
+                        last_error=None
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                symbol = str(recovered.get("Symbol") or "").strip()
+
+                # Restore only the symbol needed by the monitor. This does not
+                # fabricate a proposal/order ID or alter SOXL state.
+                odts_last_order["symbol"] = symbol
+
                 _odts_monitor_update(
-                    symbol=None,
+                    symbol=symbol,
                     last_check_at=datetime.now(timezone.utc).isoformat(),
-                    last_status="NO_ODTS_ORDER_YET",
-                    last_decision="WAIT", last_bid=None,
-                    stop_price=None, target_price=None,
-                    exit_order_sent=False, exit_response=None,
+                    last_status="RECOVERED_AFTER_RESTART",
+                    last_decision="WAIT",
+                    exit_order_sent=False,
+                    exit_response=None,
                     last_error=None
                 )
-                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
-                continue
 
             state = _odts_monitor_snapshot()
             if state.get("symbol") == symbol and state.get("exit_order_sent"):
