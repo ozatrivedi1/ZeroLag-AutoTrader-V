@@ -62,6 +62,21 @@ ODTS_SIM_EXIT_ENABLED = os.getenv(
     "NO"
 ).strip().upper()
 
+# Independent gate for the ODTS background position monitor.
+# Default NO: deployment alone never starts automatic exit monitoring.
+ODTS_CONTINUOUS_MONITOR_ENABLED = os.getenv(
+    "ODTS_CONTINUOUS_MONITOR_ENABLED",
+    "NO"
+).strip().upper()
+
+try:
+    ODTS_MONITOR_INTERVAL_SECONDS = max(
+        3.0,
+        float(os.getenv("ODTS_MONITOR_INTERVAL_SECONDS", "5"))
+    )
+except (TypeError, ValueError):
+    ODTS_MONITOR_INTERVAL_SECONDS = 5.0
+
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
@@ -158,6 +173,22 @@ odts_last_order = {
     "order_id": None,
     "limit_price": None,
     "time": 0,
+}
+
+odts_monitor_lock = threading.Lock()
+odts_monitor_state = {
+    "thread_started": False,
+    "running": False,
+    "symbol": None,
+    "last_check_at": None,
+    "last_status": "NOT_STARTED",
+    "last_decision": "WAIT",
+    "last_bid": None,
+    "stop_price": None,
+    "target_price": None,
+    "exit_order_sent": False,
+    "exit_response": None,
+    "last_error": None,
 }
 
 ODTS_PROPOSAL_TTL_SECONDS = 120
@@ -3095,6 +3126,237 @@ def odts_position_monitor_test():
         ),
         "position": position,
     })
+
+
+
+# ==============================================================
+# ODTS QQQ CONTINUOUS SIM POSITION MONITOR V1
+# ==============================================================
+
+def _odts_monitor_snapshot():
+    with odts_monitor_lock:
+        return dict(odts_monitor_state)
+
+
+def _odts_monitor_update(**kwargs):
+    with odts_monitor_lock:
+        odts_monitor_state.update(kwargs)
+
+
+def _odts_continuous_monitor_worker():
+    _odts_monitor_update(thread_started=True, running=True, last_status="STARTED")
+
+    while True:
+        try:
+            if ODTS_CONTINUOUS_MONITOR_ENABLED != "YES":
+                _odts_monitor_update(
+                    running=False, last_status="MONITOR_GATE_OFF",
+                    last_decision="WAIT"
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            _odts_monitor_update(running=True)
+
+            if not odts_sim_session_now():
+                _odts_monitor_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="OUTSIDE_REGULAR_SESSION",
+                    last_decision="WAIT", last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            symbol = str(odts_last_order.get("symbol") or "").strip()
+
+            # Do not scan the account. Only an option created by this ODTS
+            # process is eligible for automatic monitoring/exiting.
+            if not symbol:
+                _odts_monitor_update(
+                    symbol=None,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="NO_ODTS_ORDER_YET",
+                    last_decision="WAIT", last_bid=None,
+                    stop_price=None, target_price=None,
+                    exit_order_sent=False, exit_response=None,
+                    last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            state = _odts_monitor_snapshot()
+            if state.get("symbol") == symbol and state.get("exit_order_sent"):
+                _odts_monitor_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EXIT_ALREADY_SUBMITTED"
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            access_token, token_error = get_valid_access_token()
+            if not access_token:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="AUTH_REQUIRED",
+                    last_decision="WAIT", last_error=token_error
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+            if not ok:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="POSITION_QUERY_FAILED",
+                    last_decision="WAIT", last_error=detail
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            if not position:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="WAITING_FOR_POSITION",
+                    last_decision="WAIT", last_bid=None, last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            try:
+                avg = float(position.get("average_price") or 0)
+                qty = float(position.get("quantity") or 0)
+                bid = float(position.get("bid") or 0)
+            except (TypeError, ValueError):
+                avg, qty, bid = 0.0, 0.0, 0.0
+
+            if avg <= 0 or qty != 1.0:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="POSITION_SAFETY_BLOCK",
+                    last_decision="WAIT",
+                    last_bid=bid if bid > 0 else None,
+                    last_error="Exactly one long contract with valid AveragePrice is required."
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            stop_price = round(avg * 0.65, 2)
+            target_price = round(avg * 1.50, 2)
+
+            if bid <= 0:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="PRICE_NOT_READY",
+                    last_decision="WAIT", last_bid=None,
+                    stop_price=stop_price, target_price=target_price,
+                    last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            if bid <= stop_price:
+                decision = "EXIT_STOP"
+            elif bid >= target_price:
+                decision = "EXIT_TARGET"
+            else:
+                decision = "HOLD"
+
+            _odts_monitor_update(
+                symbol=symbol,
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="MONITORING",
+                last_decision=decision,
+                last_bid=bid,
+                stop_price=stop_price,
+                target_price=target_price,
+                last_error=None
+            )
+
+            if decision in ("EXIT_STOP", "EXIT_TARGET"):
+                with odts_order_lock:
+                    ok2, position2, detail2 = get_odts_sim_option_position(
+                        access_token, symbol
+                    )
+                    if not ok2 or not position2:
+                        _odts_monitor_update(
+                            last_status="EXIT_REVALIDATION_FAILED",
+                            last_error=detail2
+                        )
+                    else:
+                        try:
+                            qty2 = float(position2.get("quantity") or 0)
+                        except (TypeError, ValueError):
+                            qty2 = 0.0
+
+                        if qty2 != 1.0:
+                            _odts_monitor_update(
+                                last_status="EXIT_REVALIDATION_BLOCKED",
+                                last_error="Position quantity changed; SELLTOCLOSE blocked."
+                            )
+                        else:
+                            sent, result = submit_odts_sim_option_exit_order(
+                                access_token, symbol, quantity=1
+                            )
+                            _odts_monitor_update(
+                                exit_order_sent=bool(sent),
+                                exit_response=result,
+                                last_status=(
+                                    "EXIT_ORDER_SUBMITTED"
+                                    if sent else "EXIT_TRIGGERED_ORDER_NOT_SENT"
+                                ),
+                                last_error=None if sent else result
+                            )
+
+            time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+
+        except Exception as exc:
+            log.exception("ODTS CONTINUOUS MONITOR ERROR | %s", exc)
+            _odts_monitor_update(
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="MONITOR_ERROR",
+                last_decision="WAIT",
+                last_error=str(exc)
+            )
+            time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+
+
+def start_odts_continuous_monitor():
+    with odts_monitor_lock:
+        if odts_monitor_state.get("thread_started"):
+            return False
+        odts_monitor_state["thread_started"] = True
+
+    threading.Thread(
+        target=_odts_continuous_monitor_worker,
+        name="odts-continuous-monitor",
+        daemon=True
+    ).start()
+    return True
+
+
+@app.get("/odts-continuous-monitor-status")
+def odts_continuous_monitor_status():
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "ODTS_CONTINUOUS_MONITOR_ENABLED": ODTS_CONTINUOUS_MONITOR_ENABLED,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "poll_interval_seconds": ODTS_MONITOR_INTERVAL_SECONDS,
+        "odts_last_order_symbol": odts_last_order.get("symbol"),
+        "state": _odts_monitor_snapshot(),
+        "safety": (
+            "Only the ODTS-created option symbol is monitored. "
+            "Automatic SELLTOCLOSE also requires ODTS_SIM_EXIT_ENABLED=YES."
+        )
+    })
+
+
+start_odts_continuous_monitor()
 
 
 # ==============================================================
