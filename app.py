@@ -2306,9 +2306,11 @@ def odts_approval_test():
             f"/odts-approval-decision?proposal_id={proposal_id}&decision=PASS"
         ),
         "safety": (
-            "QQQ option execution is isolated from SOXL. APPROVE can submit only "
-            "when the independent ODTS SIM gate is YES, market is open, the "
-            "proposal is fresh, and the contract passes immediate revalidation."
+            "QQQ option execution is isolated from SOXL. APPROVE authorizes the "
+            "current qualified directional setup, not one frozen strike. At APPROVE "
+            "time the selector immediately chooses the current best qualified contract "
+            "and all SIM, session, DTE, option-type, Delta, spread and risk gates are "
+            "revalidated before any order can be submitted."
         ),
     })
 
@@ -2402,25 +2404,59 @@ def odts_approval_decision():
                 "detail": current,
             }), 409
 
-        if str(current.get("symbol", "")).strip() != proposal.get("symbol"):
-            return jsonify({
-                "ok": False,
-                "order_sent": False,
-                "error": "Blocked: selected contract changed since approval proposal.",
-                "approved_symbol": proposal.get("symbol"),
-                "current_symbol": current.get("symbol"),
-            }), 409
+        # APPROVE authorizes the directional setup, not one exact strike.
+        # The selector may legitimately move to another qualified strike/expiry
+        # between proposal creation and the user's approval. We therefore use
+        # the current selected contract, while revalidating every frozen gate.
+        current_symbol = str(current.get("symbol", "")).strip()
+        current_option_type = str(current.get("option_type", "")).strip().upper()
 
         try:
             approved_ask = float(proposal.get("ask"))
             current_ask = float(current.get("ask"))
             current_spread_pct = float(current.get("spread_pct"))
             current_abs_delta = float(current.get("abs_delta"))
+            current_dte = int(current.get("dte"))
         except (TypeError, ValueError):
             return jsonify({
                 "ok": False,
                 "order_sent": False,
                 "error": "Blocked: invalid live option quote during revalidation.",
+            }), 409
+
+        if not current_symbol.upper().startswith("QQQ"):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current selected contract is not a QQQ option.",
+                "current_symbol": current_symbol,
+            }), 409
+
+        expected_option_type = "CALL" if direction == "BULLISH" else "PUT"
+        if current_option_type != expected_option_type:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current option type does not match approved direction.",
+                "direction": direction,
+                "expected_option_type": expected_option_type,
+                "current_option_type": current_option_type,
+            }), 409
+
+        if current_dte not in {1, 2}:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current contract is not 1-2 DTE.",
+                "dte": current_dte,
+            }), 409
+
+        if current_ask <= 0:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current Ask is not valid.",
+                "current_ask": current_ask,
             }), 409
 
         if current_spread_pct > 15.0:
@@ -2439,19 +2475,24 @@ def odts_approval_decision():
                 "abs_delta": current_abs_delta,
             }), 409
 
+        # Risk/cost guard remains tied to what the user saw at proposal time.
+        # A different qualified strike is allowed, but not a >5% increase in
+        # premium cost versus the approved setup reference.
         max_allowed_ask = approved_ask * (1.0 + ODTS_MAX_ASK_INCREASE_PCT / 100.0)
         if current_ask > max_allowed_ask:
             return jsonify({
                 "ok": False,
                 "order_sent": False,
-                "error": "Blocked: Ask increased more than 5% since proposal.",
-                "approved_ask": approved_ask,
+                "error": "Blocked: current qualified contract costs more than 5% above the approved setup reference.",
+                "proposal_symbol": proposal.get("symbol"),
+                "current_symbol": current_symbol,
+                "approved_ask_reference": approved_ask,
                 "current_ask": current_ask,
                 "max_allowed_ask": round(max_allowed_ask, 4),
             }), 409
 
         if (
-            odts_last_order.get("symbol") == proposal.get("symbol")
+            odts_last_order.get("symbol") == current_symbol
             and now_ts - float(odts_last_order.get("time", 0))
             < ODTS_DUPLICATE_WINDOW_SECONDS
         ):
@@ -2474,7 +2515,7 @@ def odts_approval_decision():
         proposal["used"] = True
         ok, order_result = submit_odts_sim_option_limit_order(
             access_token=access_token,
-            option_symbol=proposal.get("symbol"),
+            option_symbol=current_symbol,
             limit_price=current_ask,
             quantity=1,
         )
@@ -2501,7 +2542,7 @@ def odts_approval_decision():
             order_id = None
 
         odts_last_order["proposal_id"] = proposal_id
-        odts_last_order["symbol"] = proposal.get("symbol")
+        odts_last_order["symbol"] = current_symbol
         odts_last_order["order_id"] = order_id
         odts_last_order["limit_price"] = round(current_ask, 2)
         odts_last_order["time"] = time.time()
@@ -2514,7 +2555,9 @@ def odts_approval_decision():
             "approval_recorded": True,
             "order_sent": True,
             "proposal_id": proposal_id,
-            "selected_contract": proposal.get("symbol"),
+            "proposal_contract": proposal.get("symbol"),
+            "selected_contract": current_symbol,
+            "contract_changed_since_proposal": current_symbol != proposal.get("symbol"),
             "quantity_contracts": 1,
             "trade_action": "BUYTOOPEN",
             "order_type": "Limit",
