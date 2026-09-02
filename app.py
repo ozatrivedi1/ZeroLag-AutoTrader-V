@@ -2692,6 +2692,141 @@ def odts_fill_capture_test():
 
 
 # ==============================================================
+# ODTS QQQ POSITION MONITOR / EXIT DECISION - READ ONLY V1
+# ==============================================================
+
+@app.get("/odts-position-monitor-test")
+def odts_position_monitor_test():
+    """READ-ONLY ODTS position monitor and exit-decision test.
+
+    Uses the authoritative SIM position AveragePrice as the fill reference.
+    For a long option, the current BID is used as the conservative executable
+    exit reference. The endpoint returns HOLD, EXIT_STOP, or EXIT_TARGET only;
+    it never calls SELLTOCLOSE or any other order function.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "exit_order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "decision": "WAIT",
+            "message": "No ODTS option symbol is stored yet. This is expected before the first SIM entry.",
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "exit_order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "decision": "WAIT",
+            "symbol": symbol,
+            "message": "No matching SIM position exists yet; monitoring will begin after the BUYTOOPEN fill appears.",
+        })
+
+    try:
+        avg = float(position.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    try:
+        qty = float(position.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        bid = float(position.get("bid") or 0)
+    except (TypeError, ValueError):
+        bid = 0.0
+    try:
+        last = float(position.get("last") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+
+    if avg <= 0 or qty <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "POSITION_DATA_NOT_READY",
+            "decision": "WAIT",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+
+    # A long option is sold to exit, so BID is the conservative executable
+    # reference. LAST is reported for information only and is not the trigger.
+    current_exit_reference = bid if bid > 0 else None
+
+    if current_exit_reference is None:
+        decision = "WAIT"
+        reason = "No valid BID is available; exit decision is intentionally withheld."
+        status = "PRICE_NOT_READY"
+        pnl_pct = None
+        pnl_dollars = None
+    else:
+        pnl_pct = round(((current_exit_reference / avg) - 1.0) * 100.0, 2)
+        pnl_dollars = round((current_exit_reference - avg) * 100.0 * qty, 2)
+        if current_exit_reference <= stop_price:
+            decision = "EXIT_STOP"
+            reason = "Current BID is at or below the -35% stop level."
+        elif current_exit_reference >= target_price:
+            decision = "EXIT_TARGET"
+            reason = "Current BID is at or above the +50% target level."
+        else:
+            decision = "HOLD"
+            reason = "Current BID remains between the stop and target levels."
+        status = "MONITORING_DRY_RUN"
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "environment": "SIM",
+        "exit_order_sent": False,
+        "status": status,
+        "decision": decision,
+        "reason": reason,
+        "symbol": symbol,
+        "quantity_contracts": qty,
+        "actual_fill_price": avg,
+        "current_bid": bid if bid > 0 else None,
+        "current_last": last if last > 0 else None,
+        "exit_reference": "BID",
+        "max_loss_pct": 35.0,
+        "stop_option_price": stop_price,
+        "profit_target_pct": 50.0,
+        "target_option_price": target_price,
+        "unrealized_pct_from_bid": pnl_pct,
+        "unrealized_dollars_from_bid": pnl_dollars,
+        "planned_exit_action": "SELLTOCLOSE",
+        "safety": "DRY RUN ONLY. This endpoint cannot submit, replace, cancel, or close any order.",
+        "position": position,
+    })
+
+
+# ==============================================================
 # POSITION
 # ==============================================================
 
