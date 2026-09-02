@@ -1380,7 +1380,7 @@ def odts_qqq_indicators_test():
 
 
 # ==============================================================
-# ODTS OPTION QUOTE + GREEKS TEST
+# ODTS QQQ OPTION CONTRACT SELECTOR V1
 # READ ONLY / NO ORDER SUBMISSION
 # ==============================================================
 
@@ -1395,90 +1395,597 @@ def odts_option_test():
             "next_step": "Open /login"
         }), 401
 
-    # Temporary test contract:
-    # QQQ Sep 1, 2026 718 Call
-    symbol = "QQQ 260901C718"
+    # ----------------------------------------------------------
+    # ODTS V1 FROZEN SELECTION INPUTS
+    # ----------------------------------------------------------
+    underlying = "QQQ"
+    allowed_dte = [1, 2]
+    target_delta_min = 0.50
+    target_delta_max = 0.65
+    target_delta_mid = (
+        target_delta_min + target_delta_max
+    ) / 2.0
 
-    url = (
-        f"{TS_API_BASE_URL}"
-        f"/marketdata/stream/options/quotes"
-    )
+    # Spread rule discussed for V1:
+    # <= 10% preferred, > 15% rejected.
+    preferred_spread_pct = 10.0
+    max_spread_pct = 15.0
 
-    params = {
-        "legs[0].Symbol": symbol,
-        "legs[0].Ratio": 1,
-        "enableGreeks": "true"
-    }
+    # Number of strikes above and below the underlying used by
+    # TradeStation's option-chain stream. 12 gives ample room
+    # around ATM for the 0.50-0.65 Delta target.
+    strike_proximity = 12
 
-    try:
-        response = requests.get(
-            url,
-            headers=ts_headers(access_token),
-            params=params,
-            stream=True,
-            timeout=20
-        )
+    # Direction is intentionally READ ONLY and may be supplied as:
+    #   /odts-option-test?direction=BULLISH
+    #   /odts-option-test?direction=BEARISH
+    #   /odts-option-test?direction=BOTH
+    # Until the signal engine is connected, BOTH is the default.
+    direction = str(
+        request.args.get("direction", "BOTH")
+    ).strip().upper()
 
-        if not response.ok:
-            return jsonify({
-                "ok": False,
-                "read_only": True,
-                "order_sent": False,
-                "symbol": symbol,
-                "status_code": response.status_code,
-                "response": response.text[:1000]
-            }), response.status_code
+    if direction in {"CALL", "LONG_CALL"}:
+        direction = "BULLISH"
+    elif direction in {"PUT", "LONG_PUT"}:
+        direction = "BEARISH"
 
-        for line in response.iter_lines():
-            if not line:
-                continue
-
-            text = line.decode("utf-8").strip()
-
-            try:
-                quote = json.loads(text)
-            except Exception:
-                quote = {"raw": text}
-
-            response.close()
-
-            return jsonify({
-                "ok": True,
-                "read_only": True,
-                "order_sent": False,
-                "symbol": symbol,
-                "bid": quote.get("Bid", ""),
-                "ask": quote.get("Ask", ""),
-                "last": quote.get("Last", ""),
-                "volume": quote.get("Volume", ""),
-                "open_interest": quote.get("DailyOpenInterest", ""),
-                "delta": quote.get("Delta", ""),
-                "gamma": quote.get("Gamma", ""),
-                "theta": quote.get("Theta", ""),
-                "vega": quote.get("Vega", ""),
-                "implied_volatility": quote.get("ImpliedVolatility", ""),
-                "probability_itm": quote.get("ProbabilityITM", ""),
-                "probability_otm": quote.get("ProbabilityOTM", "")
-            })
-
-        response.close()
-
+    if direction not in {"BULLISH", "BEARISH", "BOTH"}:
         return jsonify({
             "ok": False,
             "read_only": True,
             "order_sent": False,
-            "symbol": symbol,
-            "error": "No option quote data was returned."
-        }), 502
+            "underlying": underlying,
+            "error": (
+                "direction must be BULLISH, BEARISH, or BOTH"
+            )
+        }), 400
 
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+
+        if not raw:
+            return None
+
+        # TradeStation expirations normally arrive as
+        # 2026-09-03T00:00:00Z. Keep a few safe fallbacks.
+        candidates = [
+            raw,
+            raw.replace("Z", "+00:00"),
+            raw[:10],
+        ]
+
+        for candidate in candidates:
+            try:
+                return datetime.fromisoformat(
+                    candidate
+                ).date()
+            except Exception:
+                pass
+
+        for fmt in (
+            "%m-%d-%Y",
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+        ):
+            try:
+                return datetime.strptime(
+                    raw[:10],
+                    fmt
+                ).date()
+            except Exception:
+                pass
+
+        return None
+
+    def candidate_from_chain(item, dte, expiration_date):
+        if not isinstance(item, dict):
+            return None
+
+        # Ignore stream-status and error messages.
+        if item.get("StreamStatus") or item.get("Error"):
+            return None
+
+        legs = item.get("Legs", [])
+        leg = (
+            legs[0]
+            if isinstance(legs, list)
+            and legs
+            and isinstance(legs[0], dict)
+            else {}
+        )
+
+        option_type = str(
+            item.get("Side")
+            or leg.get("OptionType")
+            or ""
+        ).strip().upper()
+
+        if option_type not in {"CALL", "PUT"}:
+            return None
+
+        delta_raw = safe_float(item.get("Delta"))
+
+        if delta_raw is None:
+            return None
+
+        abs_delta = abs(delta_raw)
+
+        if not (
+            target_delta_min
+            <= abs_delta
+            <= target_delta_max
+        ):
+            return None
+
+        bid = safe_float(item.get("Bid"))
+        ask = safe_float(item.get("Ask"))
+        last = safe_float(item.get("Last"))
+        mid = safe_float(item.get("Mid"))
+
+        if (
+            bid is None
+            or ask is None
+            or bid <= 0
+            or ask <= 0
+            or ask < bid
+        ):
+            return None
+
+        if mid is None or mid <= 0:
+            mid = (bid + ask) / 2.0
+
+        spread = ask - bid
+        spread_pct = (
+            (spread / mid) * 100.0
+            if mid > 0
+            else None
+        )
+
+        if (
+            spread_pct is None
+            or spread_pct > max_spread_pct
+        ):
+            return None
+
+        symbol = str(
+            leg.get("Symbol")
+            or item.get("Symbol")
+            or ""
+        ).strip()
+
+        strike = safe_float(
+            leg.get("StrikePrice")
+        )
+
+        if strike is None:
+            strikes = item.get("Strikes", [])
+            if isinstance(strikes, list) and strikes:
+                strike = safe_float(strikes[0])
+
+        open_interest = safe_int(
+            item.get("DailyOpenInterest"),
+            0
+        )
+        volume = safe_int(
+            item.get("Volume"),
+            0
+        )
+
+        # No hard OI/volume cutoff yet. We use both as ranking
+        # preferences so V1 does not invent an unapproved rule.
+        # Lower score is better.
+        delta_distance = abs(
+            abs_delta - target_delta_mid
+        )
+
+        spread_penalty = spread_pct / 100.0
+        oi_bonus = min(open_interest, 5000) / 500000.0
+        volume_bonus = min(volume, 5000) / 1000000.0
+
+        score = (
+            delta_distance
+            + spread_penalty
+            - oi_bonus
+            - volume_bonus
+        )
+
+        spread_status = (
+            "PREFERRED"
+            if spread_pct <= preferred_spread_pct
+            else "ACCEPTABLE"
+        )
+
+        gross_cost = ask * 100.0
+
+        return {
+            "symbol": symbol,
+            "option_type": option_type.title(),
+            "expiration": expiration_date.isoformat(),
+            "dte": dte,
+            "strike": (
+                round(strike, 4)
+                if strike is not None
+                else ""
+            ),
+            "delta": round(delta_raw, 6),
+            "abs_delta": round(abs_delta, 6),
+            "bid": round(bid, 4),
+            "ask": round(ask, 4),
+            "mid": round(mid, 4),
+            "last": (
+                round(last, 4)
+                if last is not None
+                else ""
+            ),
+            "spread": round(spread, 4),
+            "spread_pct": round(spread_pct, 4),
+            "spread_status": spread_status,
+            "volume": volume,
+            "open_interest": open_interest,
+            "gamma": item.get("Gamma", ""),
+            "theta": item.get("Theta", ""),
+            "vega": item.get("Vega", ""),
+            "implied_volatility": item.get(
+                "ImpliedVolatility",
+                ""
+            ),
+            "probability_itm": item.get(
+                "ProbabilityITM",
+                ""
+            ),
+            "probability_otm": item.get(
+                "ProbabilityOTM",
+                ""
+            ),
+            "gross_premium_cost_1_contract": round(
+                gross_cost,
+                2
+            ),
+            "absolute_worst_case_loss_1_contract": round(
+                gross_cost,
+                2
+            ),
+            "planned_trade_risk": (
+                "NOT YET SET - approval remains disabled"
+            ),
+            "score": round(score, 8),
+        }
+
+    # ----------------------------------------------------------
+    # 1) GET AVAILABLE QQQ EXPIRATIONS
+    # ----------------------------------------------------------
+    expiration_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/options/expirations/{underlying}"
+    )
+
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
     except requests.RequestException as exc:
         return jsonify({
             "ok": False,
             "read_only": True,
             "order_sent": False,
-            "symbol": symbol,
-            "error": f"Option quote request failed: {exc}"
+            "underlying": underlying,
+            "error": (
+                f"QQQ expiration request failed: {exc}"
+            )
         }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000]
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "error": (
+                "TradeStation expiration response was not valid JSON."
+            )
+        }), 502
+
+    expirations = (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    )
+
+    today_et = now_et().date()
+    eligible_expirations = []
+
+    for expiration_item in expirations:
+        if not isinstance(expiration_item, dict):
+            continue
+
+        expiration_date = parse_expiration(
+            expiration_item.get("Date")
+        )
+
+        if expiration_date is None:
+            continue
+
+        dte = (
+            expiration_date - today_et
+        ).days
+
+        expiration_type = str(
+            expiration_item.get("Type", "")
+        ).strip()
+
+        # Match the OptionStation setup: Weeklys only, 1-2 DTE.
+        if (
+            dte in allowed_dte
+            and expiration_type.lower() == "weekly"
+        ):
+            eligible_expirations.append({
+                "date": expiration_date,
+                "dte": dte,
+                "type": expiration_type,
+            })
+
+    eligible_expirations.sort(
+        key=lambda item: (
+            item["dte"],
+            item["date"]
+        )
+    )
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "allowed_dte": allowed_dte,
+            "expiration_type": "Weekly",
+            "error": (
+                "No QQQ Weekly expiration was found at exactly "
+                "1 or 2 calendar DTE."
+            )
+        }), 404
+
+    # ----------------------------------------------------------
+    # 2) STREAM INITIAL CHAIN SNAPSHOT FOR EACH 1-2 DTE EXPIRY
+    # ----------------------------------------------------------
+    all_candidates = []
+    stream_notes = []
+
+    chain_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/options/chains/{underlying}"
+    )
+
+    for expiry in eligible_expirations:
+        expiration_date = expiry["date"]
+        expiration_param = expiration_date.strftime(
+            "%m-%d-%Y"
+        )
+
+        chain_params = {
+            "expiration": expiration_param,
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "All",
+        }
+
+        chain_response = None
+        message_count = 0
+        candidate_count = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(5, 4)
+            )
+
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500]
+                })
+                chain_response.close()
+                continue
+
+            # For Single + All with strikeProximity=12, an initial
+            # snapshot is normally about 50 contracts (25 strikes x
+            # Call/Put). We stop after 60 messages so this HTTP route
+            # never becomes a permanent streaming connection.
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+
+                text = line.decode(
+                    "utf-8",
+                    errors="replace"
+                ).strip()
+
+                if not text:
+                    continue
+
+                try:
+                    item = json.loads(text)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") == "EndSnapshot":
+                    break
+
+                if item.get("StreamStatus") == "GoAway":
+                    break
+
+                message_count += 1
+
+                candidate = candidate_from_chain(
+                    item,
+                    expiry["dte"],
+                    expiration_date
+                )
+
+                if candidate is not None:
+                    all_candidates.append(candidate)
+                    candidate_count += 1
+
+                if message_count >= 60:
+                    break
+
+        except requests.RequestException as exc:
+            # If the stream times out after its initial burst, keep
+            # any candidates already collected and report the note.
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": candidate_count > 0,
+                "message_count": message_count,
+                "candidate_count": candidate_count,
+                "note": str(exc)[:300]
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration")
+            == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+                "candidate_count": candidate_count,
+            })
+
+    calls = [
+        item
+        for item in all_candidates
+        if item["option_type"] == "Call"
+    ]
+
+    puts = [
+        item
+        for item in all_candidates
+        if item["option_type"] == "Put"
+    ]
+
+    calls.sort(key=lambda item: item["score"])
+    puts.sort(key=lambda item: item["score"])
+
+    best_call = calls[0] if calls else None
+    best_put = puts[0] if puts else None
+
+    selected = None
+
+    if direction == "BULLISH":
+        selected = best_call
+    elif direction == "BEARISH":
+        selected = best_put
+
+    if direction == "BULLISH" and best_call is None:
+        selection_status = "NO QUALIFIED CALL"
+    elif direction == "BEARISH" and best_put is None:
+        selection_status = "NO QUALIFIED PUT"
+    elif direction == "BOTH":
+        selection_status = (
+            "REFERENCE ONLY - BOTH SIDES RETURNED"
+        )
+    else:
+        selection_status = "QUALIFIED CONTRACT FOUND"
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "underlying": underlying,
+        "direction": direction,
+        "selection_status": selection_status,
+        "rules": {
+            "expiration_type": "Weekly",
+            "allowed_dte": allowed_dte,
+            "target_abs_delta": [
+                target_delta_min,
+                target_delta_max
+            ],
+            "preferred_spread_pct_max": (
+                preferred_spread_pct
+            ),
+            "reject_spread_pct_above": max_spread_pct,
+            "liquidity_rule": (
+                "Open interest and volume are ranking preferences; "
+                "no hard cutoff is enabled in V1."
+            ),
+            "quantity_reference": 1,
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "qualified_candidate_count": len(all_candidates),
+        "best_call": best_call,
+        "best_put": best_put,
+        "selected_contract": selected,
+        "stream_notes": stream_notes,
+        "risk_gate": {
+            "gross_premium_and_absolute_worst_case": (
+                "CALCULATED FROM ASK x 100"
+            ),
+            "planned_trade_risk": "NOT YET SET",
+            "profit_target": "NOT YET SET",
+            "reward_risk": "NOT YET SET",
+            "approval": "DISABLED"
+        },
+        "next_step": (
+            "Verify selector output against OptionStation Pro. "
+            "No option order can be sent from this route."
+        )
+    })
 
 
 # ==============================================================
