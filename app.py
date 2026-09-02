@@ -2018,6 +2018,114 @@ def odts_option_test():
 
 
 # ==============================================================
+# ODTS QQQ SIM APPROVE / PASS SAFETY LAYER
+# NO OPTION ORDER SUBMISSION IN THIS VERSION
+# ==============================================================
+
+@app.get("/odts-approval-test")
+def odts_approval_test():
+    direction = str(
+        request.args.get("direction", "")
+    ).strip().upper()
+
+    if direction not in {"BULLISH", "BEARISH"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "error": "direction must be BULLISH or BEARISH"
+        }), 400
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": True,
+        "approval_mode": "SIM SAFETY TEST - NO ORDER CAPABILITY",
+        "direction": direction,
+        "quantity_contracts": 1,
+        "max_loss_pct": 35.0,
+        "profit_target_pct": 50.0,
+        "reward_risk": round(50.0 / 35.0, 4),
+        "approve_action": (
+            f"/odts-approval-decision?direction={direction}&decision=APPROVE"
+        ),
+        "pass_action": (
+            f"/odts-approval-decision?direction={direction}&decision=PASS"
+        ),
+        "safety": (
+            "APPROVE/PASS is being tested separately from SOXL. "
+            "Neither action can submit an option order in this version."
+        ),
+        "next_step": (
+            "First verify APPROVE and PASS behavior. Option execution "
+            "will be added only after this safety layer is verified."
+        )
+    })
+
+
+@app.route("/odts-approval-decision", methods=["GET", "POST"])
+def odts_approval_decision():
+    direction = str(
+        request.values.get("direction", "")
+    ).strip().upper()
+
+    decision = str(
+        request.values.get("decision", "")
+    ).strip().upper()
+
+    if direction not in {"BULLISH", "BEARISH"}:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "approval_recorded": False,
+            "error": "direction must be BULLISH or BEARISH"
+        }), 400
+
+    if decision not in {"APPROVE", "PASS"}:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "approval_recorded": False,
+            "error": "decision must be APPROVE or PASS"
+        }), 400
+
+    if decision == "PASS":
+        return jsonify({
+            "ok": True,
+            "environment": "SIM",
+            "direction": direction,
+            "decision": "PASS",
+            "approval_recorded": False,
+            "order_sent": False,
+            "result": "PASSED - NO ORDER",
+            "safety": "No TradeStation order function was called."
+        })
+
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "direction": direction,
+        "decision": "APPROVE",
+        "approval_recorded": True,
+        "order_sent": False,
+        "result": "APPROVAL SAFETY TEST PASSED - ORDER STILL BLOCKED",
+        "quantity_contracts": 1,
+        "max_loss_pct": 35.0,
+        "profit_target_pct": 50.0,
+        "safety": (
+            "This endpoint intentionally does not call any TradeStation "
+            "option order-submission function. SOXL execution paths are unchanged."
+        ),
+        "next_step": (
+            "After APPROVE/PASS behavior is verified, add a separate ODTS-only "
+            "SIM option order function with its own safety gates."
+        )
+    })
+
+
+# ==============================================================
 # POSITION
 # ==============================================================
 
