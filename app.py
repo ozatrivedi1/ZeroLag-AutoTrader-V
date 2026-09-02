@@ -3565,6 +3565,21 @@ def odts_continuous_monitor_status():
 start_odts_continuous_monitor()
 
 
+@app.get("/odts-process-status")
+def odts_process_status():
+    """READ ONLY diagnostic confirming the process serving this request."""
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "process_id": os.getpid(),
+        "authenticated_in_this_process": bool(token_store.get("access_token")),
+        "monitor_thread_started": _odts_monitor_snapshot().get("thread_started"),
+        "monitor_running": _odts_monitor_snapshot().get("running"),
+        "recommended_render_start_command": "gunicorn --workers 1 --threads 4 app:app",
+        "safety": "Diagnostic only. No order function is called."
+    })
+
+
 # ==============================================================
 # POSITION
 # ==============================================================
