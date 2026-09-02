@@ -1411,6 +1411,13 @@ def odts_option_test():
     preferred_spread_pct = 10.0
     max_spread_pct = 15.0
 
+    # ODTS SIM V1 frozen risk/target controls.
+    # These are DISPLAY-ONLY in this revision. No option order can
+    # be submitted from this route.
+    quantity_contracts = 1
+    max_loss_pct = 35.0
+    profit_target_pct = 50.0
+
     # Number of strikes above and below the underlying used by
     # TradeStation's option-chain stream. 12 gives ample room
     # around ATM for the 0.50-0.65 Delta target.
@@ -1612,7 +1619,16 @@ def odts_option_test():
             else "ACCEPTABLE"
         )
 
-        gross_cost = ask * 100.0
+        gross_cost = ask * 100.0 * quantity_contracts
+        planned_exit_price = ask * (1.0 - max_loss_pct / 100.0)
+        planned_target_price = ask * (1.0 + profit_target_pct / 100.0)
+        planned_risk_dollars = gross_cost * (max_loss_pct / 100.0)
+        planned_profit_dollars = gross_cost * (profit_target_pct / 100.0)
+        reward_risk = (
+            planned_profit_dollars / planned_risk_dollars
+            if planned_risk_dollars > 0
+            else None
+        )
 
         return {
             "symbol": symbol,
@@ -1654,16 +1670,19 @@ def odts_option_test():
                 "ProbabilityOTM",
                 ""
             ),
-            "gross_premium_cost_1_contract": round(
-                gross_cost,
-                2
-            ),
-            "absolute_worst_case_loss_1_contract": round(
-                gross_cost,
-                2
-            ),
-            "planned_trade_risk": (
-                "NOT YET SET - approval remains disabled"
+            "quantity_contracts": quantity_contracts,
+            "gross_premium_cost": round(gross_cost, 2),
+            "absolute_worst_case_loss": round(gross_cost, 2),
+            "max_loss_pct": max_loss_pct,
+            "planned_exit_option_price": round(planned_exit_price, 4),
+            "planned_risk_dollars": round(planned_risk_dollars, 2),
+            "profit_target_pct": profit_target_pct,
+            "planned_target_option_price": round(planned_target_price, 4),
+            "planned_profit_dollars": round(planned_profit_dollars, 2),
+            "reward_risk": (
+                round(reward_risk, 4)
+                if reward_risk is not None
+                else ""
             ),
             "score": round(score, 8),
         }
@@ -1957,7 +1976,13 @@ def odts_option_test():
                 "Open interest and volume are ranking preferences; "
                 "no hard cutoff is enabled in V1."
             ),
-            "quantity_reference": 1,
+            "quantity_contracts": quantity_contracts,
+            "max_loss_pct": max_loss_pct,
+            "profit_target_pct": profit_target_pct,
+            "exit_rule": (
+                "EXIT WHEN -35% MAX LOSS OR +50% PROFIT TARGET "
+                "IS REACHED, WHICHEVER OCCURS FIRST"
+            ),
         },
         "eligible_expirations": [
             {
@@ -1973,13 +1998,17 @@ def odts_option_test():
         "selected_contract": selected,
         "stream_notes": stream_notes,
         "risk_gate": {
-            "gross_premium_and_absolute_worst_case": (
-                "CALCULATED FROM ASK x 100"
+            "quantity_contracts": quantity_contracts,
+            "entry_reference": "LIVE ASK",
+            "max_loss_pct": max_loss_pct,
+            "profit_target_pct": profit_target_pct,
+            "reward_risk": round(profit_target_pct / max_loss_pct, 4),
+            "exit_rule": (
+                "WHICHEVER OCCURS FIRST: -35% PREMIUM LOSS OR "
+                "+50% PREMIUM GAIN"
             ),
-            "planned_trade_risk": "NOT YET SET",
-            "profit_target": "NOT YET SET",
-            "reward_risk": "NOT YET SET",
-            "approval": "DISABLED"
+            "approval": "DISABLED",
+            "order_capability": "DISABLED - READ ONLY"
         },
         "next_step": (
             "Verify selector output against OptionStation Pro. "
