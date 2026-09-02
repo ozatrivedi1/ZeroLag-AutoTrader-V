@@ -2769,8 +2769,9 @@ def odts_position_monitor_test():
 
     Uses the authoritative SIM position AveragePrice as the fill reference.
     For a long option, the current BID is used as the conservative executable
-    exit reference. The endpoint returns HOLD, EXIT_STOP, or EXIT_TARGET only;
-    it never calls SELLTOCLOSE or any other order function.
+    exit reference. The endpoint returns HOLD, EXIT_STOP, or EXIT_TARGET.
+    When an EXIT_* decision occurs, it passes the request to the separate ODTS
+    SIM exit function. That function remains hard-gated by ODTS_SIM_EXIT_ENABLED.
     """
     access_token, error = get_valid_access_token()
     if not access_token:
@@ -2868,11 +2869,26 @@ def odts_position_monitor_test():
             reason = "Current BID remains between the stop and target levels."
         status = "MONITORING_DRY_RUN"
 
+    exit_order_sent = False
+    exit_execution = None
+    if decision in ("EXIT_STOP", "EXIT_TARGET"):
+        exit_order_sent, exit_execution = submit_odts_sim_option_exit_order(
+            access_token, symbol, quantity=1
+        )
+        if exit_order_sent:
+            status = "EXIT_ORDER_SUBMITTED"
+        elif ODTS_SIM_EXIT_ENABLED != "YES":
+            status = "EXIT_TRIGGERED_GATE_BLOCKED"
+        else:
+            status = "EXIT_TRIGGERED_ORDER_NOT_SENT"
+
     return jsonify({
         "ok": True,
-        "read_only": True,
+        "read_only": ODTS_SIM_EXIT_ENABLED != "YES",
         "environment": "SIM",
-        "exit_order_sent": False,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "exit_order_sent": exit_order_sent,
+        "exit_execution": exit_execution,
         "status": status,
         "decision": decision,
         "reason": reason,
@@ -2889,7 +2905,11 @@ def odts_position_monitor_test():
         "unrealized_pct_from_bid": pnl_pct,
         "unrealized_dollars_from_bid": pnl_dollars,
         "planned_exit_action": "SELLTOCLOSE",
-        "safety": "DRY RUN ONLY. This endpoint cannot submit, replace, cancel, or close any order.",
+        "safety": (
+            "Exit trigger is connected, but ODTS_SIM_EXIT_ENABLED is not YES, so SELLTOCLOSE is blocked."
+            if ODTS_SIM_EXIT_ENABLED != "YES"
+            else "Exit trigger is connected and SIM SELLTOCLOSE execution is enabled."
+        ),
         "position": position,
     })
 
