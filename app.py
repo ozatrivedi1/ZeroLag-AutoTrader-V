@@ -3453,18 +3453,43 @@ def _odts_continuous_monitor_worker():
             time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
 
 
-def start_odts_continuous_monitor():
-    with odts_monitor_lock:
-        if odts_monitor_state.get("thread_started"):
-            return False
-        odts_monitor_state["thread_started"] = True
+odts_monitor_thread = None
 
-    threading.Thread(
-        target=_odts_continuous_monitor_worker,
-        name="odts-continuous-monitor",
-        daemon=True
-    ).start()
+
+def start_odts_continuous_monitor():
+    """
+    Start the daemon inside the actual Gunicorn worker process.
+    Do not trust an inherited thread_started flag from a parent process.
+    """
+    global odts_monitor_thread
+
+    with odts_monitor_lock:
+        if (
+            odts_monitor_thread is not None
+            and odts_monitor_thread.is_alive()
+        ):
+            return False
+
+        odts_monitor_state["thread_started"] = True
+        odts_monitor_state["running"] = True
+        odts_monitor_state["last_status"] = "STARTING_IN_WORKER"
+
+        odts_monitor_thread = threading.Thread(
+            target=_odts_continuous_monitor_worker,
+            name="odts-continuous-monitor",
+            daemon=True
+        )
+        odts_monitor_thread.start()
+
     return True
+
+
+@app.before_request
+def ensure_odts_continuous_monitor_worker():
+    # Gunicorn may import application state before the serving worker is fully
+    # active. Starting/repairing the daemon here guarantees it belongs to the
+    # process that is actually handling requests and owns the OAuth token.
+    start_odts_continuous_monitor()
 
 
 
@@ -3562,9 +3587,6 @@ def odts_continuous_monitor_status():
     })
 
 
-start_odts_continuous_monitor()
-
-
 @app.get("/odts-process-status")
 def odts_process_status():
     """READ ONLY diagnostic confirming the process serving this request."""
@@ -3574,6 +3596,9 @@ def odts_process_status():
         "process_id": os.getpid(),
         "authenticated_in_this_process": bool(token_store.get("access_token")),
         "monitor_thread_started": _odts_monitor_snapshot().get("thread_started"),
+        "monitor_thread_alive": bool(
+            odts_monitor_thread is not None and odts_monitor_thread.is_alive()
+        ),
         "monitor_running": _odts_monitor_snapshot().get("running"),
         "recommended_render_start_command": "gunicorn --workers 1 --threads 4 app:app",
         "safety": "Diagnostic only. No order function is called."
