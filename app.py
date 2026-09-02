@@ -56,6 +56,12 @@ ODTS_SIM_TRADING_ENABLED = os.getenv(
     "NO"
 ).strip().upper()
 
+# Independent master gate for ODTS QQQ SIM exits. Default NO.
+ODTS_SIM_EXIT_ENABLED = os.getenv(
+    "ODTS_SIM_EXIT_ENABLED",
+    "NO"
+).strip().upper()
+
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
@@ -2690,6 +2696,68 @@ def odts_fill_capture_test():
         "safety": "READ ONLY. This endpoint cannot submit or close an order.",
     })
 
+
+
+def submit_odts_sim_option_exit_order(access_token, option_symbol, quantity=1):
+    """ODTS-only long-option exit framework. SIM only, exactly 1 contract.
+
+    This function is hard-gated by ODTS_SIM_EXIT_ENABLED and is not called by
+    the dry-run monitor. It uses SELLTOCLOSE with a market order only after the
+    monitor has independently produced EXIT_STOP or EXIT_TARGET.
+    """
+    if not odts_sim_environment_ok():
+        return False, {"error": "Blocked: ODTS option exits require the TradeStation SIM API base URL."}
+    if ODTS_SIM_EXIT_ENABLED != "YES":
+        return False, {"error": "Blocked: ODTS_SIM_EXIT_ENABLED is not YES."}
+    if not TS_SIM_ACCOUNT_ID:
+        return False, {"error": "Blocked: TS_SIM_ACCOUNT_ID is missing."}
+    if int(quantity) != 1:
+        return False, {"error": "Blocked: ODTS V1 permits exactly 1 option contract."}
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, {"error": "Blocked: ODTS V1 permits QQQ option symbols only."}
+    if not odts_sim_session_now():
+        return False, {"error": "Blocked: ODTS SIM option exit is outside 09:30-16:00 ET."}
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Market",
+        "TradeAction": "SELLTOCLOSE",
+        "TimeInForce": {"Duration": "DAY"},
+    }
+    try:
+        response = requests.post(
+            f"{TS_API_BASE_URL}/orderexecution/orders",
+            headers=ts_headers(access_token), json=order, timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, {"error": f"ODTS SIM exit request failed: {exc}", "submitted_order": order}
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+    if not response.ok:
+        return False, {"status_code": response.status_code, "response": body, "submitted_order": order}
+    return True, {"response": body, "submitted_order": order}
+
+
+@app.get("/odts-exit-framework-test")
+def odts_exit_framework_test():
+    """Safety/status test only. Never submits an exit order."""
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "quantity_contracts": 1,
+        "trade_action": "SELLTOCLOSE",
+        "order_type": "Market",
+        "trigger_source": "EXIT_STOP or EXIT_TARGET from ODTS monitor",
+        "exit_order_sent": False,
+        "read_only_test": True,
+        "safety": "Framework loaded. This test endpoint never calls the exit-order function.",
+    })
 
 # ==============================================================
 # ODTS QQQ POSITION MONITOR / EXIT DECISION - READ ONLY V1
