@@ -149,6 +149,8 @@ odts_proposals = {}
 odts_last_order = {
     "proposal_id": None,
     "symbol": None,
+    "order_id": None,
+    "limit_price": None,
     "time": 0,
 }
 
@@ -2483,8 +2485,19 @@ def odts_approval_decision():
                 "detail": order_result,
             }), 502
 
+        # Preserve the submitted order identity for later fill capture.
+        order_id = None
+        try:
+            orders = (order_result.get("response") or {}).get("Orders", [])
+            if isinstance(orders, list) and orders:
+                order_id = str(orders[0].get("OrderID") or "").strip() or None
+        except Exception:
+            order_id = None
+
         odts_last_order["proposal_id"] = proposal_id
         odts_last_order["symbol"] = proposal.get("symbol")
+        odts_last_order["order_id"] = order_id
+        odts_last_order["limit_price"] = round(current_ask, 2)
         odts_last_order["time"] = time.time()
 
         return jsonify({
@@ -2506,6 +2519,176 @@ def odts_approval_decision():
             "tradestation": order_result,
             "safety": "SOXL order functions were not used.",
         })
+
+
+# ==============================================================
+# ODTS QQQ FILL CAPTURE / POSITION MONITOR - READ ONLY V1
+# ==============================================================
+
+def get_odts_sim_option_position(access_token, option_symbol):
+    """Read one exact QQQ option position from the TradeStation SIM account.
+
+    This function is READ ONLY. It never submits, replaces, or cancels an order.
+    TradeStation's Positions resource supplies AveragePrice, Quantity and Symbol;
+    AveragePrice is used as the authoritative filled-position entry reference.
+    """
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, None, {"error": "ODTS fill capture permits QQQ option symbols only."}
+
+    if not odts_sim_environment_ok():
+        return False, None, {"error": "ODTS fill capture requires the SIM API base URL."}
+
+    if not TS_SIM_ACCOUNT_ID:
+        return False, None, {"error": "TS_SIM_ACCOUNT_ID is missing."}
+
+    url = f"{TS_API_BASE_URL}/brokerage/accounts/{TS_SIM_ACCOUNT_ID}/positions"
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params={"symbol": option_symbol},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, None, {"error": f"ODTS position request failed: {exc}"}
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, None, {"status_code": response.status_code, "response": body}
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        positions = []
+
+    target = option_symbol.upper()
+    for position in positions:
+        symbol = str(position.get("Symbol") or "").strip().upper()
+        if symbol != target:
+            continue
+
+        try:
+            qty = float(position.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            avg_price = float(position.get("AveragePrice") or 0)
+        except (TypeError, ValueError):
+            avg_price = 0.0
+
+        normalized = {
+            "account_id": position.get("AccountID"),
+            "position_id": position.get("PositionID"),
+            "symbol": position.get("Symbol"),
+            "asset_type": position.get("AssetType"),
+            "long_short": position.get("LongShort"),
+            "quantity": qty,
+            "average_price": avg_price,
+            "last": position.get("Last"),
+            "bid": position.get("Bid"),
+            "ask": position.get("Ask"),
+            "market_value": position.get("MarketValue"),
+            "unrealized_pl": position.get("UnrealizedProfitLoss"),
+            "unrealized_pl_pct": position.get("UnrealizedProfitLossPercent"),
+            "timestamp": position.get("Timestamp"),
+        }
+        return True, normalized, body
+
+    return True, None, body
+
+
+@app.get("/odts-fill-capture-test")
+def odts_fill_capture_test():
+    """READ-ONLY test of automatic fill/position capture.
+
+    Before the first SIM trade this should normally return WAITING_FOR_POSITION.
+    After a BUYTOOPEN fills, it captures TradeStation AveragePrice and computes
+    the actual -35% and +50% option-price levels from the fill.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "message": "No ODTS option symbol is stored yet. This is expected before the first SIM entry.",
+            "last_order": odts_last_order,
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "symbol": symbol,
+            "stored_order_id": odts_last_order.get("order_id"),
+            "stored_limit_price": odts_last_order.get("limit_price"),
+            "message": "No matching SIM position exists yet; no fill price has been captured.",
+        })
+
+    avg = float(position.get("average_price") or 0)
+    if avg <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "POSITION_FOUND_FILL_PRICE_PENDING",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+    actual_cost = round(avg * 100.0, 2)
+    planned_risk = round(actual_cost * 0.35, 2)
+    planned_profit = round(actual_cost * 0.50, 2)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "status": "FILL_CAPTURED_FROM_SIM_POSITION",
+        "environment": "SIM",
+        "symbol": symbol,
+        "quantity_contracts": position.get("quantity"),
+        "actual_fill_price": avg,
+        "actual_contract_cost": actual_cost,
+        "max_loss_pct": 35.0,
+        "actual_stop_option_price": stop_price,
+        "planned_risk_dollars": planned_risk,
+        "profit_target_pct": 50.0,
+        "actual_target_option_price": target_price,
+        "planned_profit_dollars": planned_profit,
+        "reward_risk": round(50.0 / 35.0, 4),
+        "position": position,
+        "stored_order_id": odts_last_order.get("order_id"),
+        "safety": "READ ONLY. This endpoint cannot submit or close an order.",
+    })
 
 
 # ==============================================================
