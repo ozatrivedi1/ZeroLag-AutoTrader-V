@@ -49,6 +49,13 @@ LIVE_TRADING_ENABLED = os.getenv(
     "NO"
 ).strip().upper()
 
+# Independent master gate for ODTS QQQ option execution in TradeStation SIM.
+# Default NO so deployment alone can never submit an option order.
+ODTS_SIM_TRADING_ENABLED = os.getenv(
+    "ODTS_SIM_TRADING_ENABLED",
+    "NO"
+).strip().upper()
+
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
@@ -135,6 +142,19 @@ journal_lock = threading.Lock()
 # Serializes LIVE position-check + order submission so two webhooks
 # cannot pass the position gate at the same time.
 live_order_lock = threading.Lock()
+
+# Completely separate lock/state for ODTS QQQ option approvals/orders.
+odts_order_lock = threading.Lock()
+odts_proposals = {}
+odts_last_order = {
+    "proposal_id": None,
+    "symbol": None,
+    "time": 0,
+}
+
+ODTS_PROPOSAL_TTL_SECONDS = 120
+ODTS_DUPLICATE_WINDOW_SECONDS = 60
+ODTS_MAX_ASK_INCREASE_PCT = 5.0
 
 oauth_state = None
 
@@ -677,6 +697,16 @@ def live_market_session_now():
 def live_regular_session_now():
     # Backward-compatible alias used by older status/test code.
     return live_market_session_now()
+
+
+def odts_sim_session_now():
+    """ODTS V1 entries are restricted to the regular QQQ session."""
+    return live_market_session_now()
+
+
+def odts_sim_environment_ok():
+    base = TS_API_BASE_URL.lower()
+    return "sim-api.tradestation.com" in base
 
 
 # ==============================================================
@@ -2018,111 +2048,464 @@ def odts_option_test():
 
 
 # ==============================================================
-# ODTS QQQ SIM APPROVE / PASS SAFETY LAYER
-# NO OPTION ORDER SUBMISSION IN THIS VERSION
+# ODTS QQQ SIM APPROVE / PASS + 1-CONTRACT EXECUTION V1
+# COMPLETELY SEPARATE FROM SOXL ORDER FUNCTIONS
 # ==============================================================
+
+def _odts_selector_snapshot(direction):
+    """
+    Reuse the already-verified ODTS option selector and return its
+    selected contract as a plain dict. No order is placed here.
+    """
+    with app.test_request_context(
+        f"/odts-option-test?direction={direction}",
+        method="GET"
+    ):
+        response = odts_option_test()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS selector did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    selected = payload.get("selected_contract")
+    if not isinstance(selected, dict) or not selected.get("symbol"):
+        return False, {
+            "error": "No qualified ODTS option contract is available.",
+            "selector": payload,
+        }
+
+    return True, selected
+
+
+def _odts_new_proposal(direction, selected):
+    proposal_id = secrets.token_urlsafe(18)
+    now_ts = time.time()
+
+    proposal = {
+        "proposal_id": proposal_id,
+        "created_at": now_ts,
+        "expires_at": now_ts + ODTS_PROPOSAL_TTL_SECONDS,
+        "direction": direction,
+        "symbol": str(selected.get("symbol", "")).strip(),
+        "option_type": str(selected.get("option_type", "")).strip(),
+        "expiration": selected.get("expiration"),
+        "dte": selected.get("dte"),
+        "strike": selected.get("strike"),
+        "delta": selected.get("delta"),
+        "abs_delta": selected.get("abs_delta"),
+        "bid": selected.get("bid"),
+        "ask": selected.get("ask"),
+        "spread_pct": selected.get("spread_pct"),
+        "quantity_contracts": 1,
+        "gross_premium_cost": selected.get("gross_premium_cost"),
+        "max_loss_pct": 35.0,
+        "planned_exit_option_price": selected.get("planned_exit_option_price"),
+        "planned_risk_dollars": selected.get("planned_risk_dollars"),
+        "profit_target_pct": 50.0,
+        "planned_target_option_price": selected.get("planned_target_option_price"),
+        "planned_profit_dollars": selected.get("planned_profit_dollars"),
+        "reward_risk": selected.get("reward_risk"),
+        "used": False,
+    }
+
+    odts_proposals[proposal_id] = proposal
+
+    # Keep memory bounded.
+    cutoff = now_ts - 900
+    stale_ids = [
+        key for key, value in odts_proposals.items()
+        if value.get("created_at", 0) < cutoff
+    ]
+    for key in stale_ids:
+        odts_proposals.pop(key, None)
+
+    return proposal
+
+
+def submit_odts_sim_option_limit_order(
+    access_token,
+    option_symbol,
+    limit_price,
+    quantity=1,
+):
+    """
+    ODTS-only long option entry. This function cannot route to LIVE,
+    cannot trade SOXL, and cannot submit more than one contract.
+    """
+    if not odts_sim_environment_ok():
+        return False, {
+            "error": "Blocked: ODTS option orders require the TradeStation SIM API base URL."
+        }
+
+    if ODTS_SIM_TRADING_ENABLED != "YES":
+        return False, {
+            "error": "Blocked: ODTS_SIM_TRADING_ENABLED is not YES."
+        }
+
+    if not TS_SIM_ACCOUNT_ID:
+        return False, {
+            "error": "Blocked: TS_SIM_ACCOUNT_ID is missing."
+        }
+
+    if int(quantity) != 1:
+        return False, {
+            "error": "Blocked: ODTS V1 permits exactly 1 option contract."
+        }
+
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, {
+            "error": "Blocked: ODTS V1 permits QQQ option symbols only."
+        }
+
+    try:
+        limit_price = round(float(limit_price), 2)
+    except (TypeError, ValueError):
+        return False, {"error": "Blocked: invalid limit price."}
+
+    if limit_price <= 0:
+        return False, {"error": "Blocked: limit price must be positive."}
+
+    if not odts_sim_session_now():
+        return False, {
+            "error": "Blocked: ODTS SIM option entry is outside 09:30-16:00 ET."
+        }
+
+    url = f"{TS_API_BASE_URL}/orderexecution/orders"
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Limit",
+        "LimitPrice": str(limit_price),
+        "TradeAction": "BUYTOOPEN",
+        "TimeInForce": {"Duration": "DAY"},
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, {
+            "error": f"ODTS SIM option order request failed: {exc}",
+            "submitted_order": order,
+        }
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, {
+            "status_code": response.status_code,
+            "response": body,
+            "submitted_order": order,
+        }
+
+    return True, {
+        "response": body,
+        "submitted_order": order,
+    }
+
 
 @app.get("/odts-approval-test")
 def odts_approval_test():
-    direction = str(
-        request.args.get("direction", "")
-    ).strip().upper()
+    direction = str(request.args.get("direction", "")).strip().upper()
 
     if direction not in {"BULLISH", "BEARISH"}:
         return jsonify({
             "ok": False,
-            "read_only": True,
             "order_sent": False,
             "approval_enabled": False,
-            "error": "direction must be BULLISH or BEARISH"
+            "error": "direction must be BULLISH or BEARISH",
         }), 400
 
-    return jsonify({
-        "ok": True,
-        "read_only": True,
-        "order_sent": False,
-        "approval_enabled": True,
-        "approval_mode": "SIM SAFETY TEST - NO ORDER CAPABILITY",
-        "direction": direction,
-        "quantity_contracts": 1,
-        "max_loss_pct": 35.0,
-        "profit_target_pct": 50.0,
-        "reward_risk": round(50.0 / 35.0, 4),
-        "approve_action": (
-            f"/odts-approval-decision?direction={direction}&decision=APPROVE"
-        ),
-        "pass_action": (
-            f"/odts-approval-decision?direction={direction}&decision=PASS"
-        ),
-        "safety": (
-            "APPROVE/PASS is being tested separately from SOXL. "
-            "Neither action can submit an option order in this version."
-        ),
-        "next_step": (
-            "First verify APPROVE and PASS behavior. Option execution "
-            "will be added only after this safety layer is verified."
-        )
-    })
-
-
-@app.route("/odts-approval-decision", methods=["GET", "POST"])
-def odts_approval_decision():
-    direction = str(
-        request.values.get("direction", "")
-    ).strip().upper()
-
-    decision = str(
-        request.values.get("decision", "")
-    ).strip().upper()
-
-    if direction not in {"BULLISH", "BEARISH"}:
+    access_token, error = get_valid_access_token()
+    if not access_token:
         return jsonify({
             "ok": False,
             "order_sent": False,
-            "approval_recorded": False,
-            "error": "direction must be BULLISH or BEARISH"
-        }), 400
+            "approval_enabled": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
 
-    if decision not in {"APPROVE", "PASS"}:
+    selector_ok, selected = _odts_selector_snapshot(direction)
+    if not selector_ok:
         return jsonify({
             "ok": False,
             "order_sent": False,
-            "approval_recorded": False,
-            "error": "decision must be APPROVE or PASS"
-        }), 400
-
-    if decision == "PASS":
-        return jsonify({
-            "ok": True,
-            "environment": "SIM",
+            "approval_enabled": False,
             "direction": direction,
-            "decision": "PASS",
-            "approval_recorded": False,
-            "order_sent": False,
-            "result": "PASSED - NO ORDER",
-            "safety": "No TradeStation order function was called."
-        })
+            "error": selected.get("error", "No qualified contract."),
+            "selector_detail": selected,
+        }), 409
+
+    proposal = _odts_new_proposal(direction, selected)
+    proposal_id = proposal["proposal_id"]
+
+    approval_enabled = bool(
+        proposal.get("symbol")
+        and float(proposal.get("ask") or 0) > 0
+        and float(proposal.get("spread_pct") or 999) <= 15.0
+        and 0.50 <= float(proposal.get("abs_delta") or 0) <= 0.65
+    )
 
     return jsonify({
         "ok": True,
         "environment": "SIM",
         "direction": direction,
-        "decision": "APPROVE",
-        "approval_recorded": True,
+        "approval_enabled": approval_enabled,
         "order_sent": False,
-        "result": "APPROVAL SAFETY TEST PASSED - ORDER STILL BLOCKED",
-        "quantity_contracts": 1,
-        "max_loss_pct": 35.0,
-        "profit_target_pct": 50.0,
-        "safety": (
-            "This endpoint intentionally does not call any TradeStation "
-            "option order-submission function. SOXL execution paths are unchanged."
+        "order_gate": {
+            "ODTS_SIM_TRADING_ENABLED": ODTS_SIM_TRADING_ENABLED,
+            "sim_api": odts_sim_environment_ok(),
+            "regular_session_now": odts_sim_session_now(),
+            "quantity_contracts": 1,
+            "trade_action": "BUYTOOPEN",
+            "order_type": "Limit",
+            "limit_reference": "Current Ask revalidated at APPROVE time",
+        },
+        "proposal": proposal,
+        "approve_action": (
+            f"/odts-approval-decision?proposal_id={proposal_id}&decision=APPROVE"
         ),
-        "next_step": (
-            "After APPROVE/PASS behavior is verified, add a separate ODTS-only "
-            "SIM option order function with its own safety gates."
-        )
+        "pass_action": (
+            f"/odts-approval-decision?proposal_id={proposal_id}&decision=PASS"
+        ),
+        "safety": (
+            "QQQ option execution is isolated from SOXL. APPROVE can submit only "
+            "when the independent ODTS SIM gate is YES, market is open, the "
+            "proposal is fresh, and the contract passes immediate revalidation."
+        ),
     })
+
+
+@app.route("/odts-approval-decision", methods=["GET", "POST"])
+def odts_approval_decision():
+    decision = str(request.values.get("decision", "")).strip().upper()
+    proposal_id = str(request.values.get("proposal_id", "")).strip()
+
+    if decision not in {"APPROVE", "PASS"}:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "error": "decision must be APPROVE or PASS",
+        }), 400
+
+    proposal = odts_proposals.get(proposal_id)
+    if not proposal:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "error": "Proposal not found or expired. Generate a new approval proposal.",
+        }), 404
+
+    if decision == "PASS":
+        proposal["used"] = True
+        return jsonify({
+            "ok": True,
+            "environment": "SIM",
+            "direction": proposal.get("direction"),
+            "decision": "PASS",
+            "proposal_id": proposal_id,
+            "approval_recorded": False,
+            "order_sent": False,
+            "result": "PASSED - NO ORDER",
+            "safety": "No TradeStation order function was called.",
+        })
+
+    # From this point forward, all checks and submission are serialized.
+    with odts_order_lock:
+        now_ts = time.time()
+
+        if proposal.get("used"):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: this proposal has already been used.",
+            }), 409
+
+        if now_ts > float(proposal.get("expires_at", 0)):
+            proposal["used"] = True
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: approval proposal expired. Generate a fresh proposal.",
+            }), 409
+
+        if ODTS_SIM_TRADING_ENABLED != "YES":
+            return jsonify({
+                "ok": False,
+                "environment": "SIM",
+                "decision": "APPROVE",
+                "approval_recorded": True,
+                "order_sent": False,
+                "proposal_id": proposal_id,
+                "result": "APPROVED BUT ORDER BLOCKED",
+                "error": "ODTS_SIM_TRADING_ENABLED is not YES.",
+            }), 403
+
+        if not odts_sim_environment_ok():
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: TradeStation API base is not SIM.",
+            }), 403
+
+        if not odts_sim_session_now():
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: outside 09:30-16:00 ET regular session.",
+            }), 403
+
+        direction = proposal.get("direction")
+        selector_ok, current = _odts_selector_snapshot(direction)
+        if not selector_ok:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current selector revalidation failed.",
+                "detail": current,
+            }), 409
+
+        if str(current.get("symbol", "")).strip() != proposal.get("symbol"):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: selected contract changed since approval proposal.",
+                "approved_symbol": proposal.get("symbol"),
+                "current_symbol": current.get("symbol"),
+            }), 409
+
+        try:
+            approved_ask = float(proposal.get("ask"))
+            current_ask = float(current.get("ask"))
+            current_spread_pct = float(current.get("spread_pct"))
+            current_abs_delta = float(current.get("abs_delta"))
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: invalid live option quote during revalidation.",
+            }), 409
+
+        if current_spread_pct > 15.0:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: live spread now exceeds 15%.",
+                "spread_pct": current_spread_pct,
+            }), 409
+
+        if not (0.50 <= current_abs_delta <= 0.65):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: live Delta moved outside 0.50-0.65.",
+                "abs_delta": current_abs_delta,
+            }), 409
+
+        max_allowed_ask = approved_ask * (1.0 + ODTS_MAX_ASK_INCREASE_PCT / 100.0)
+        if current_ask > max_allowed_ask:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: Ask increased more than 5% since proposal.",
+                "approved_ask": approved_ask,
+                "current_ask": current_ask,
+                "max_allowed_ask": round(max_allowed_ask, 4),
+            }), 409
+
+        if (
+            odts_last_order.get("symbol") == proposal.get("symbol")
+            and now_ts - float(odts_last_order.get("time", 0))
+            < ODTS_DUPLICATE_WINDOW_SECONDS
+        ):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: duplicate ODTS option order window is active.",
+            }), 409
+
+        access_token, error = get_valid_access_token()
+        if not access_token:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": error,
+                "next_step": "Open /login",
+            }), 401
+
+        # Freeze this proposal immediately before the one allowed submit call.
+        proposal["used"] = True
+        ok, order_result = submit_odts_sim_option_limit_order(
+            access_token=access_token,
+            option_symbol=proposal.get("symbol"),
+            limit_price=current_ask,
+            quantity=1,
+        )
+
+        if not ok:
+            return jsonify({
+                "ok": False,
+                "environment": "SIM",
+                "decision": "APPROVE",
+                "approval_recorded": True,
+                "order_sent": False,
+                "proposal_id": proposal_id,
+                "error": "TradeStation SIM option order was not accepted.",
+                "detail": order_result,
+            }), 502
+
+        odts_last_order["proposal_id"] = proposal_id
+        odts_last_order["symbol"] = proposal.get("symbol")
+        odts_last_order["time"] = time.time()
+
+        return jsonify({
+            "ok": True,
+            "environment": "SIM",
+            "direction": direction,
+            "decision": "APPROVE",
+            "approval_recorded": True,
+            "order_sent": True,
+            "proposal_id": proposal_id,
+            "selected_contract": proposal.get("symbol"),
+            "quantity_contracts": 1,
+            "trade_action": "BUYTOOPEN",
+            "order_type": "Limit",
+            "limit_price": round(current_ask, 2),
+            "max_loss_pct": 35.0,
+            "profit_target_pct": 50.0,
+            "result": "ODTS QQQ 1-CONTRACT SIM ORDER SUBMITTED",
+            "tradestation": order_result,
+            "safety": "SOXL order functions were not used.",
+        })
 
 
 # ==============================================================
