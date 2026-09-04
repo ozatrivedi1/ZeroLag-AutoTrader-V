@@ -87,7 +87,7 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 # Notification-only feature. It cannot place, modify, cancel, or close orders.
 ODTS_EMAIL_SENDER = os.getenv("ODTS_EMAIL_SENDER", "").strip()
 ODTS_EMAIL_RECIPIENT = os.getenv("ODTS_EMAIL_RECIPIENT", "").strip()
-ODTS_EMAIL_APP_PASSWORD = os.getenv("ODTS_EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+ODTS_EMAIL_APP_PASSWORD = "".join(os.getenv("ODTS_EMAIL_APP_PASSWORD", "").split())
 ODTS_EMAIL_ALERT_ENABLED = os.getenv("ODTS_EMAIL_ALERT_ENABLED", "YES").strip().upper()
 
 try:
