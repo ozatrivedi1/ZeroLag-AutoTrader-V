@@ -5,6 +5,8 @@ import logging
 import csv
 import json
 import threading
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
@@ -78,6 +80,23 @@ except (TypeError, ValueError):
     ODTS_MONITOR_INTERVAL_SECONDS = 5.0
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+
+# ==============================================================
+# ODTS QQQ EMAIL APPROVAL ALERT SETTINGS
+# ==============================================================
+# Notification-only feature. It cannot place, modify, cancel, or close orders.
+ODTS_EMAIL_SENDER = os.getenv("ODTS_EMAIL_SENDER", "").strip()
+ODTS_EMAIL_RECIPIENT = os.getenv("ODTS_EMAIL_RECIPIENT", "").strip()
+ODTS_EMAIL_APP_PASSWORD = os.getenv("ODTS_EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+ODTS_EMAIL_ALERT_ENABLED = os.getenv("ODTS_EMAIL_ALERT_ENABLED", "YES").strip().upper()
+
+try:
+    ODTS_EMAIL_ALERT_INTERVAL_SECONDS = max(
+        30.0,
+        float(os.getenv("ODTS_EMAIL_ALERT_INTERVAL_SECONDS", "30"))
+    )
+except (TypeError, ValueError):
+    ODTS_EMAIL_ALERT_INTERVAL_SECONDS = 30.0
 
 TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
 TS_TOKEN_URL = "https://signin.tradestation.com/oauth/token"
@@ -188,6 +207,21 @@ odts_monitor_state = {
     "target_price": None,
     "exit_order_sent": False,
     "exit_response": None,
+    "last_error": None,
+}
+
+# Completely separate notification-only state. No order functions are called.
+odts_email_lock = threading.Lock()
+odts_email_state = {
+    "thread_started": False,
+    "running": False,
+    "armed": True,
+    "last_check_at": None,
+    "last_status": "NOT_STARTED",
+    "last_decision": "WAIT",
+    "last_option_symbol": None,
+    "last_email_sent_at": None,
+    "last_email_subject": None,
     "last_error": None,
 }
 
@@ -2326,6 +2360,332 @@ def odts_control_status():
 
 
 # ==============================================================
+# ODTS QQQ APPROVAL-READY EMAIL ALERT V1
+# NOTIFICATION ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+def _odts_email_config_ok():
+    return bool(
+        ODTS_EMAIL_SENDER
+        and ODTS_EMAIL_RECIPIENT
+        and ODTS_EMAIL_APP_PASSWORD
+    )
+
+
+def _odts_email_state_update(**kwargs):
+    with odts_email_lock:
+        odts_email_state.update(kwargs)
+
+
+def _odts_email_state_snapshot():
+    with odts_email_lock:
+        return dict(odts_email_state)
+
+
+def _odts_control_snapshot_for_email():
+    """Call the existing READ-ONLY unified control route and return a dict."""
+    with app.test_request_context(
+        "/odts-control-status",
+        method="GET"
+    ):
+        response = odts_control_status()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS control-status route did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+def _odts_setup_is_approval_ready(snapshot):
+    if not isinstance(snapshot, dict):
+        return False
+
+    decision = str(snapshot.get("decision") or "").strip().upper()
+    risk_gate = str(snapshot.get("risk_gate") or "").strip().upper()
+    contract_gate = str(snapshot.get("contract_gate") or "").strip().upper()
+    option_symbol = str(snapshot.get("option_symbol") or "").strip()
+
+    return bool(
+        decision in {"CALL", "PUT"}
+        and risk_gate == "YES"
+        and contract_gate == "YES"
+        and option_symbol.upper().startswith("QQQ")
+    )
+
+
+def _odts_send_email(subject, body):
+    """Send one Gmail SMTP message. Notification only; no trading side effects."""
+    if not _odts_email_config_ok():
+        return False, "Email configuration is incomplete in Render."
+
+    message = EmailMessage()
+    message["From"] = ODTS_EMAIL_SENDER
+    message["To"] = ODTS_EMAIL_RECIPIENT
+    message["Subject"] = subject
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            timeout=20
+        ) as smtp:
+            smtp.login(
+                ODTS_EMAIL_SENDER,
+                ODTS_EMAIL_APP_PASSWORD
+            )
+            smtp.send_message(message)
+    except Exception as exc:
+        log.exception("ODTS EMAIL SEND FAILED | %s", exc)
+        return False, str(exc)
+
+    return True, "Email sent."
+
+
+def _odts_build_approval_email(snapshot):
+    direction = str(snapshot.get("direction") or "").upper()
+    decision = str(snapshot.get("decision") or "").upper()
+    option_symbol = str(snapshot.get("option_symbol") or "")
+    qqq_close = snapshot.get("qqq_close", "")
+    dte = snapshot.get("dte", "")
+    strike = snapshot.get("strike", "")
+    bid = snapshot.get("bid", "")
+    ask = snapshot.get("ask", "")
+    delta = snapshot.get("abs_delta", "")
+    cost = snapshot.get("contract_cost_dollars", "")
+    risk = snapshot.get("planned_risk_dollars", "")
+    stop = snapshot.get("stop_option_price", "")
+    target = snapshot.get("target_option_price", "")
+    rr = snapshot.get("reward_risk", "")
+
+    subject = f"ODTS QQQ APPROVAL REQUIRED - {decision}"
+    proposal_url = (
+        "https://zerolag-autotrader-v.onrender.com/"
+        f"odts-approval-test?direction={direction}"
+    )
+
+    body = f"""ODTS QQQ setup is READY FOR YOUR APPROVAL.
+
+Decision: {decision}
+Direction: {direction}
+QQQ Price: {qqq_close}
+Option: {option_symbol}
+DTE: {dte}
+Strike: {strike}
+Bid / Ask: {bid} / {ask}
+Absolute Delta: {delta}
+Contract Cost: ${cost}
+Planned Max Risk: ${risk}
+Stop Option Price: {stop}
+Target Option Price: {target}
+Reward/Risk: {rr}
+
+Risk Gate: YES
+Contract Gate: YES
+Quantity: 1 contract
+Environment: SIM
+
+Create/refresh proposal:
+{proposal_url}
+
+Human APPROVE/PASS is still required. This email itself does not place an order.
+"""
+    return subject, body
+
+
+def _odts_email_alert_worker():
+    _odts_email_state_update(running=True, last_status="STARTED")
+
+    while True:
+        try:
+            if ODTS_EMAIL_ALERT_ENABLED != "YES":
+                _odts_email_state_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EMAIL_ALERT_DISABLED",
+                    last_decision="WAIT",
+                    armed=True,
+                    last_error=None
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            if not _odts_email_config_ok():
+                _odts_email_state_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EMAIL_CONFIG_INCOMPLETE",
+                    last_decision="WAIT",
+                    armed=True,
+                    last_error=(
+                        "ODTS_EMAIL_SENDER, ODTS_EMAIL_RECIPIENT, and "
+                        "ODTS_EMAIL_APP_PASSWORD are all required."
+                    )
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            ok, snapshot = _odts_control_snapshot_for_email()
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            if not ok:
+                _odts_email_state_update(
+                    last_check_at=now_iso,
+                    last_status="CONTROL_STATUS_NOT_READY",
+                    last_decision="WAIT",
+                    last_error=str(snapshot.get("error") or snapshot)[:500]
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            decision = str(snapshot.get("decision") or "WAIT").upper()
+            option_symbol = str(snapshot.get("option_symbol") or "").strip()
+            ready = _odts_setup_is_approval_ready(snapshot)
+            state = _odts_email_state_snapshot()
+
+            if not ready:
+                _odts_email_state_update(
+                    armed=True,
+                    last_check_at=now_iso,
+                    last_status="WAITING_FOR_APPROVAL_READY_SETUP",
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_error=None
+                )
+            elif state.get("armed"):
+                subject, body = _odts_build_approval_email(snapshot)
+                sent, detail = _odts_send_email(subject, body)
+
+                _odts_email_state_update(
+                    armed=not sent,
+                    last_check_at=now_iso,
+                    last_status=(
+                        "APPROVAL_EMAIL_SENT"
+                        if sent
+                        else "APPROVAL_EMAIL_FAILED"
+                    ),
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_email_sent_at=now_iso if sent else state.get("last_email_sent_at"),
+                    last_email_subject=subject if sent else state.get("last_email_subject"),
+                    last_error=None if sent else detail
+                )
+            else:
+                _odts_email_state_update(
+                    last_check_at=now_iso,
+                    last_status="READY_ALREADY_NOTIFIED",
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_error=None
+                )
+
+            time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+
+        except Exception as exc:
+            log.exception("ODTS EMAIL ALERT WORKER ERROR | %s", exc)
+            _odts_email_state_update(
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="EMAIL_WORKER_ERROR",
+                last_error=str(exc)
+            )
+            time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+
+
+def start_odts_email_alert_worker():
+    with odts_email_lock:
+        if odts_email_state.get("thread_started"):
+            return False
+        odts_email_state["thread_started"] = True
+
+    threading.Thread(
+        target=_odts_email_alert_worker,
+        name="odts-email-alert",
+        daemon=True
+    ).start()
+    return True
+
+
+@app.get("/odts-email-alert-status")
+def odts_email_alert_status():
+    return jsonify({
+        "ok": True,
+        "notification_only": True,
+        "environment": "SIM",
+        "ODTS_EMAIL_ALERT_ENABLED": ODTS_EMAIL_ALERT_ENABLED,
+        "poll_interval_seconds": ODTS_EMAIL_ALERT_INTERVAL_SECONDS,
+        "sender_configured": bool(ODTS_EMAIL_SENDER),
+        "recipient_configured": bool(ODTS_EMAIL_RECIPIENT),
+        "app_password_configured": bool(ODTS_EMAIL_APP_PASSWORD),
+        "state": _odts_email_state_snapshot(),
+        "safety": (
+            "Email alert only. This route and worker never call any SOXL or "
+            "ODTS order-submission function."
+        ),
+    })
+
+
+@app.get("/odts-email-test")
+def odts_email_test():
+    """Send one explicit test email. Never evaluates or submits an order."""
+    if not _odts_email_config_ok():
+        return jsonify({
+            "ok": False,
+            "email_sent": False,
+            "notification_only": True,
+            "error": "Email configuration is incomplete in Render."
+        }), 503
+
+    subject = "ODTS QQQ EMAIL TEST - SIM"
+    body = (
+        "ODTS QQQ email alert test succeeded if you received this message.\n\n"
+        "This is a notification-only test. No TradeStation order was placed, "
+        "modified, cancelled, or closed.\n"
+    )
+    sent, detail = _odts_send_email(subject, body)
+
+    _odts_email_state_update(
+        last_check_at=datetime.now(timezone.utc).isoformat(),
+        last_status="TEST_EMAIL_SENT" if sent else "TEST_EMAIL_FAILED",
+        last_email_sent_at=(
+            datetime.now(timezone.utc).isoformat() if sent
+            else _odts_email_state_snapshot().get("last_email_sent_at")
+        ),
+        last_email_subject=(
+            subject if sent
+            else _odts_email_state_snapshot().get("last_email_subject")
+        ),
+        last_error=None if sent else detail
+    )
+
+    return jsonify({
+        "ok": bool(sent),
+        "email_sent": bool(sent),
+        "notification_only": True,
+        "recipient_configured": bool(ODTS_EMAIL_RECIPIENT),
+        "message": detail,
+        "safety": "No order function is called by this test endpoint."
+    }), (200 if sent else 502)
+
+
+# ==============================================================
 # ODTS QQQ SIM APPROVE / PASS + 1-CONTRACT EXECUTION V1
 # COMPLETELY SEPARATE FROM SOXL ORDER FUNCTIONS
 # ==============================================================
@@ -3802,6 +4162,7 @@ def odts_continuous_monitor_status():
 
 
 start_odts_continuous_monitor()
+start_odts_email_alert_worker()
 
 
 @app.get("/odts-process-status")
@@ -3814,6 +4175,9 @@ def odts_process_status():
         "authenticated_in_this_process": bool(token_store.get("access_token")),
         "monitor_thread_started": _odts_monitor_snapshot().get("thread_started"),
         "monitor_running": _odts_monitor_snapshot().get("running"),
+        "email_alert_thread_started": _odts_email_state_snapshot().get("thread_started"),
+        "email_alert_running": _odts_email_state_snapshot().get("running"),
+        "email_alert_last_status": _odts_email_state_snapshot().get("last_status"),
         "recommended_render_start_command": "gunicorn --workers 1 --threads 4 app:app",
         "safety": "Diagnostic only. No order function is called."
     })
