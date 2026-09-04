@@ -2086,6 +2086,245 @@ def odts_option_test():
     })
 
 
+
+# ==============================================================
+# ODTS QQQ UNIFIED CONTROL STATUS V1
+# READ ONLY / AUTO DIRECTION -> CALL OR PUT CANDIDATE
+# ============================================================== 
+
+def _odts_indicator_snapshot():
+    """Return the verified QQQ 3-minute indicator route as a dict."""
+    with app.test_request_context(
+        "/odts-qqq-indicators-test",
+        method="GET"
+    ):
+        response = odts_qqq_indicators_test()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS indicator route did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+@app.get("/odts-control-status")
+def odts_control_status():
+    """
+    One READ-ONLY Excel-friendly ODTS snapshot.
+
+    Direction is determined automatically from the current verified
+    3-minute QQQ ZLEMA state:
+        +1 -> BULLISH -> CALL selector
+        -1 -> BEARISH -> PUT selector
+         0 -> NEUTRAL -> no option selection
+
+    This route NEVER submits an order and does not alter SOXL logic.
+    """
+    indicators_ok, indicators = _odts_indicator_snapshot()
+
+    if not indicators_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "environment": "SIM",
+            "error": indicators.get(
+                "error",
+                "Unable to read QQQ indicators."
+            ),
+            "next_step": indicators.get("next_step", "Open /login"),
+        }), int(indicators.get("status_code", 502) or 502)
+
+    zlema_state = int(indicators.get("zlema_state", 0) or 0)
+    zlema_confirm = int(indicators.get("zlema_confirm", 0) or 0)
+    qqq_close = _odts_float(indicators.get("qqq_close"))
+    vwap = _odts_float(indicators.get("vwap"))
+    ema21 = _odts_float(indicators.get("ema21"))
+    adx14 = _odts_float(indicators.get("adx14"))
+
+    if zlema_state > 0:
+        direction = "BULLISH"
+        option_side = "CALL"
+    elif zlema_state < 0:
+        direction = "BEARISH"
+        option_side = "PUT"
+    else:
+        direction = "NEUTRAL"
+        option_side = ""
+
+    trend_alignment = "WAIT"
+    if (
+        direction == "BULLISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close > vwap
+        and qqq_close > ema21
+    ):
+        trend_alignment = "YES"
+    elif (
+        direction == "BEARISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close < vwap
+        and qqq_close < ema21
+    ):
+        trend_alignment = "YES"
+
+    zlema_gate = "YES" if zlema_confirm >= 2 else "WAIT"
+
+    if adx14 is not None and adx14 >= 20.0:
+        adx_gate = "YES"
+    elif adx14 is not None and adx14 >= 15.0:
+        adx_gate = "CAUTION"
+    else:
+        adx_gate = "WAIT"
+
+    selected = None
+    selector_error = ""
+
+    if direction in {"BULLISH", "BEARISH"}:
+        selector_ok, selector_result = _odts_selector_snapshot(direction)
+        if selector_ok:
+            selected = selector_result
+        else:
+            selector_error = str(
+                selector_result.get(
+                    "error",
+                    "No qualified option contract is available."
+                )
+            )
+
+    contract_gate = "WAIT"
+    risk_gate = "WAIT"
+
+    if isinstance(selected, dict):
+        dte = int(selected.get("dte", 0) or 0)
+        abs_delta = _odts_float(selected.get("abs_delta"))
+        spread_pct = _odts_float(selected.get("spread_pct"))
+
+        contract_qualified = (
+            dte in {1, 2}
+            and abs_delta is not None
+            and 0.50 <= abs_delta <= 0.65
+            and spread_pct is not None
+            and spread_pct <= 15.0
+        )
+
+        if contract_qualified:
+            contract_gate = "YES"
+            risk_gate = "YES"
+
+    # This is intentionally a conservative pre-approval decision.
+    # Human APPROVE/PASS remains required for entry; this route itself
+    # is strictly read-only.
+    setup_ready = (
+        direction in {"BULLISH", "BEARISH"}
+        and trend_alignment == "YES"
+        and zlema_gate == "YES"
+        and adx_gate in {"YES", "CAUTION"}
+        and contract_gate == "YES"
+        and risk_gate == "YES"
+    )
+
+    if setup_ready:
+        decision = option_side
+        approval_status = "READY FOR PROPOSAL"
+    else:
+        decision = "WAIT"
+        approval_status = "WAIT"
+
+    def sval(key, default=""):
+        if not isinstance(selected, dict):
+            return default
+        value = selected.get(key, default)
+        return default if value is None else value
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "environment": "SIM",
+        "symbol": "QQQ",
+        "timeframe": indicators.get("timeframe", "3 Minute"),
+        "bar_timestamp": indicators.get("bar_timestamp", ""),
+
+        # Automatic direction / decision
+        "direction": direction,
+        "option_side": option_side,
+        "decision": decision,
+        "approval_status": approval_status,
+
+        # QQQ live indicators
+        "qqq_close": indicators.get("qqq_close", ""),
+        "zlema_state": zlema_state,
+        "zlema_confirm": zlema_confirm,
+        "adx14": indicators.get("adx14", ""),
+        "vwap": indicators.get("vwap", ""),
+        "ema21": indicators.get("ema21", ""),
+
+        # Gate status
+        "trend_alignment_gate": trend_alignment,
+        "zlema_confirmation_gate": zlema_gate,
+        "adx_gate": adx_gate,
+        "contract_gate": contract_gate,
+        "risk_gate": risk_gate,
+
+        # Current automatically selected contract
+        "option_symbol": sval("symbol"),
+        "option_type": sval("option_type"),
+        "expiration": sval("expiration"),
+        "dte": sval("dte"),
+        "strike": sval("strike"),
+        "bid": sval("bid"),
+        "ask": sval("ask"),
+        "mid": sval("mid"),
+        "spread_pct": sval("spread_pct"),
+        "abs_delta": sval("abs_delta"),
+        "volume": sval("volume"),
+        "open_interest": sval("open_interest"),
+        "implied_volatility": sval("implied_volatility"),
+
+        # Frozen 1-contract risk / reward fields
+        "quantity_contracts": sval("quantity_contracts", 1),
+        "contract_cost_dollars": sval("gross_premium_cost"),
+        "max_loss_pct": sval("max_loss_pct", 35.0),
+        "planned_risk_dollars": sval("planned_risk_dollars"),
+        "stop_option_price": sval("planned_exit_option_price"),
+        "profit_target_pct": sval("profit_target_pct", 50.0),
+        "planned_profit_dollars": sval("planned_profit_dollars"),
+        "target_option_price": sval("planned_target_option_price"),
+        "reward_risk": sval("reward_risk", 1.4286),
+
+        "selector_error": selector_error,
+        "safety": (
+            "READ ONLY. Automatic direction and contract selection only. "
+            "Human APPROVE/PASS is still required. SOXL order functions "
+            "are not used by this endpoint."
+        ),
+    })
+
+
 # ==============================================================
 # ODTS QQQ SIM APPROVE / PASS + 1-CONTRACT EXECUTION V1
 # COMPLETELY SEPARATE FROM SOXL ORDER FUNCTIONS
@@ -3453,43 +3692,18 @@ def _odts_continuous_monitor_worker():
             time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
 
 
-odts_monitor_thread = None
-
-
 def start_odts_continuous_monitor():
-    """
-    Start the daemon inside the actual Gunicorn worker process.
-    Do not trust an inherited thread_started flag from a parent process.
-    """
-    global odts_monitor_thread
-
     with odts_monitor_lock:
-        if (
-            odts_monitor_thread is not None
-            and odts_monitor_thread.is_alive()
-        ):
+        if odts_monitor_state.get("thread_started"):
             return False
-
         odts_monitor_state["thread_started"] = True
-        odts_monitor_state["running"] = True
-        odts_monitor_state["last_status"] = "STARTING_IN_WORKER"
 
-        odts_monitor_thread = threading.Thread(
-            target=_odts_continuous_monitor_worker,
-            name="odts-continuous-monitor",
-            daemon=True
-        )
-        odts_monitor_thread.start()
-
+    threading.Thread(
+        target=_odts_continuous_monitor_worker,
+        name="odts-continuous-monitor",
+        daemon=True
+    ).start()
     return True
-
-
-@app.before_request
-def ensure_odts_continuous_monitor_worker():
-    # Gunicorn may import application state before the serving worker is fully
-    # active. Starting/repairing the daemon here guarantees it belongs to the
-    # process that is actually handling requests and owns the OAuth token.
-    start_odts_continuous_monitor()
 
 
 
@@ -3587,6 +3801,9 @@ def odts_continuous_monitor_status():
     })
 
 
+start_odts_continuous_monitor()
+
+
 @app.get("/odts-process-status")
 def odts_process_status():
     """READ ONLY diagnostic confirming the process serving this request."""
@@ -3596,9 +3813,6 @@ def odts_process_status():
         "process_id": os.getpid(),
         "authenticated_in_this_process": bool(token_store.get("access_token")),
         "monitor_thread_started": _odts_monitor_snapshot().get("thread_started"),
-        "monitor_thread_alive": bool(
-            odts_monitor_thread is not None and odts_monitor_thread.is_alive()
-        ),
         "monitor_running": _odts_monitor_snapshot().get("running"),
         "recommended_render_start_command": "gunicorn --workers 1 --threads 4 app:app",
         "safety": "Diagnostic only. No order function is called."
