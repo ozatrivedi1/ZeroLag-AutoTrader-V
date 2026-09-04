@@ -1488,7 +1488,7 @@ def odts_qqq_indicators_test():
 # ==============================================================
 
 @app.get("/odts-option-test")
-def odts_option_test():
+def odts_option_test(direction_override=None):
     access_token, error = get_valid_access_token()
 
     if not access_token:
@@ -1532,7 +1532,9 @@ def odts_option_test():
     #   /odts-option-test?direction=BOTH
     # Until the signal engine is connected, BOTH is the default.
     direction = str(
-        request.args.get("direction", "BOTH")
+        direction_override
+        if direction_override is not None
+        else request.args.get("direction", "BOTH")
     ).strip().upper()
 
     if direction in {"CALL", "LONG_CALL"}:
@@ -2128,11 +2130,10 @@ def odts_option_test():
 
 def _odts_indicator_snapshot():
     """Return the verified QQQ 3-minute indicator route as a dict."""
-    with app.test_request_context(
-        "/odts-qqq-indicators-test",
-        method="GET"
-    ):
-        response = odts_qqq_indicators_test()
+    # Call the verified route function directly. Avoid Flask's
+    # test_request_context at runtime because flask.testing can trigger
+    # an import-cycle failure under the deployed Python/Flask stack.
+    response = odts_qqq_indicators_test()
 
     status_code = 200
     if isinstance(response, tuple):
@@ -2384,10 +2385,9 @@ def _odts_email_state_snapshot():
 
 def _odts_control_snapshot_for_email():
     """Call the existing READ-ONLY unified control route and return a dict."""
-    with app.test_request_context(
-        "/odts-control-status",
-        method="GET"
-    ):
+    # Background email worker: use only an application context.
+    # This avoids importing flask.testing / EnvironBuilder at runtime.
+    with app.app_context():
         response = odts_control_status()
 
     status_code = 200
@@ -2777,11 +2777,8 @@ def _odts_selector_snapshot(direction):
     Reuse the already-verified ODTS option selector and return its
     selected contract as a plain dict. No order is placed here.
     """
-    with app.test_request_context(
-        f"/odts-option-test?direction={direction}",
-        method="GET"
-    ):
-        response = odts_option_test()
+    # Pass direction explicitly so no synthetic Flask test request is needed.
+    response = odts_option_test(direction_override=direction)
 
     status_code = 200
     if isinstance(response, tuple):
