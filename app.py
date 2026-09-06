@@ -1027,6 +1027,104 @@ def odts_qqq_test():
         }), 502
 
 
+# ==============================================================
+# NVDA COVERED CALL - UNDERLYING QUOTE TEST
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-test")
+def odts_nvda_covered_call_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    symbol = "NVDA"
+
+    encoded_symbol = requests.utils.quote(
+        symbol,
+        safe=""
+    )
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/quotes/"
+        f"{encoded_symbol}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=20
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "symbol": symbol,
+                "status_code": response.status_code,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            text = line.decode("utf-8").strip()
+
+            try:
+                quote = json.loads(text)
+            except Exception:
+                quote = {"raw": text}
+
+            response.close()
+
+            return jsonify({
+                "ok": True,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "symbol": symbol,
+                "bid": quote.get("Bid", ""),
+                "ask": quote.get("Ask", ""),
+                "last": quote.get("Last", ""),
+                "volume": quote.get("Volume", ""),
+                "previous_close": quote.get("PreviousClose", ""),
+                "net_change": quote.get("NetChange", ""),
+                "net_change_pct": quote.get("NetChangePct", "")
+            })
+
+        response.close()
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "symbol": symbol,
+            "error": "No NVDA quote data was returned."
+        }), 502
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "symbol": symbol,
+            "error": f"NVDA quote request failed: {exc}"
+        }), 502
+
+
 
 # ==============================================================
 # ODTS QQQ 3-MIN INDICATORS TEST
