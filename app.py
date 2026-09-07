@@ -1125,6 +1125,226 @@ def odts_nvda_covered_call_test():
         }), 502
 
 
+# ==============================================================
+# NVDA COVERED CALL - EXACT OPTION CONTRACT QUOTE (READ ONLY)
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-option-test")
+def odts_nvda_covered_call_option_test():
+    """Return one exact NVDA call contract for Excel decision support.
+
+    This endpoint is permanently read-only.  It cannot submit an order.
+    Query parameters make it possible to change the contract later without
+    another GitHub/Render code change, for example:
+      ?expiration=09-25-2026&strike=250
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    underlying = "NVDA"
+    expiration_raw = str(
+        request.args.get("expiration", "09-25-2026")
+    ).strip()
+    strike_raw = str(request.args.get("strike", "250")).strip()
+
+    try:
+        expiration_date = datetime.strptime(
+            expiration_raw, "%m-%d-%Y"
+        ).date()
+        strike_target = float(strike_raw)
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "error": (
+                "Use expiration=MM-DD-YYYY and a numeric strike."
+            )
+        }), 400
+
+    chain_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/options/chains/{underlying}"
+    )
+    chain_params = {
+        "expiration": expiration_date.strftime("%m-%d-%Y"),
+        "strikeProximity": 40,
+        "spreadType": "Single",
+        "enableGreeks": "true",
+        "optionType": "Call",
+    }
+
+    def number(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def whole(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    response = None
+
+    try:
+        response = requests.get(
+            chain_url,
+            headers=ts_headers(access_token),
+            params=chain_params,
+            stream=True,
+            timeout=(5, 6)
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "status_code": response.status_code,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        message_count = 0
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+
+            if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                break
+            if item.get("Error"):
+                continue
+
+            message_count += 1
+            legs = item.get("Legs", [])
+            leg = (
+                legs[0]
+                if isinstance(legs, list)
+                and legs
+                and isinstance(legs[0], dict)
+                else {}
+            )
+
+            option_type = str(
+                item.get("Side") or leg.get("OptionType") or ""
+            ).strip().upper()
+            strike = number(leg.get("StrikePrice"))
+            if strike is None:
+                strikes = item.get("Strikes", [])
+                if isinstance(strikes, list) and strikes:
+                    strike = number(strikes[0])
+
+            if (
+                option_type == "CALL"
+                and strike is not None
+                and abs(strike - strike_target) < 0.0001
+            ):
+                bid = number(item.get("Bid"))
+                ask = number(item.get("Ask"))
+                last = number(item.get("Last"))
+                mid = number(item.get("Mid"))
+                if mid is None and bid is not None and ask is not None:
+                    mid = (bid + ask) / 2.0
+
+                spread = (
+                    ask - bid
+                    if bid is not None and ask is not None
+                    else None
+                )
+                spread_pct = (
+                    spread / mid
+                    if spread is not None and mid not in (None, 0)
+                    else None
+                )
+
+                return jsonify({
+                    "ok": True,
+                    "read_only": True,
+                    "order_sent": False,
+                    "project": "NVDA_COVERED_CALL",
+                    "underlying": underlying,
+                    "symbol": str(
+                        leg.get("Symbol") or item.get("Symbol") or ""
+                    ).strip(),
+                    "option_type": "Call",
+                    "expiration": expiration_date.isoformat(),
+                    "dte": (expiration_date - now_et().date()).days,
+                    "strike": strike,
+                    "bid": bid if bid is not None else "",
+                    "ask": ask if ask is not None else "",
+                    "last": last if last is not None else "",
+                    "mid": mid if mid is not None else "",
+                    "spread": spread if spread is not None else "",
+                    "spread_pct": (
+                        spread_pct if spread_pct is not None else ""
+                    ),
+                    "delta": number(item.get("Delta"), ""),
+                    "implied_volatility": number(
+                        item.get("ImpliedVolatility"), ""
+                    ),
+                    "volume": whole(item.get("Volume"), 0),
+                    "open_interest": whole(
+                        item.get("DailyOpenInterest"), 0
+                    ),
+                    "gamma": number(item.get("Gamma"), ""),
+                    "theta": number(item.get("Theta"), ""),
+                    "vega": number(item.get("Vega"), ""),
+                }), 200
+
+            if message_count >= 200:
+                break
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "underlying": underlying,
+            "expiration": expiration_date.isoformat(),
+            "strike": strike_target,
+            "option_type": "Call",
+            "error": "The exact NVDA call contract was not found."
+        }), 404
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "error": f"NVDA option quote request failed: {exc}"
+        }), 502
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 # ==============================================================
 # ODTS QQQ 3-MIN INDICATORS TEST
