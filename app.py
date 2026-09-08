@@ -6501,6 +6501,597 @@ def webhook_status():
     })
 
 
+
+# ==============================================================
+# #10 ODTS QQQ VERTICAL V1 - READ ONLY SELECTOR
+# SIM DESIGN / NO ORDER SUBMISSION / NO APPROVE-PASS EXECUTION
+# ==============================================================
+
+@app.get("/odts-vertical-test")
+def odts_vertical_test():
+    """
+    QQQ Vertical V1 read-only selector.
+
+    Frozen V1 rules:
+      - BULLISH -> Bull Call Debit Spread
+      - BEARISH -> Bear Put Debit Spread
+      - Weekly expiration, exactly 1 or 2 calendar DTE
+      - Long-leg absolute Delta 0.50 to 0.65
+      - Short leg exactly $2 away, same expiration
+      - Both legs require valid Bid/Ask and <=15% individual spread
+      - Net debit > $0 and <= $1.00
+      - Minimum reward:risk >= 1.00:1
+      - One spread, SIM design only
+      - Entry window 10:00 AM to 3:00 PM ET
+      - Profit exit at +50% of maximum possible profit
+      - Protective exit at -50% of original net debit
+      - Mandatory time exit 3:45 PM ET
+
+    This route NEVER submits, modifies, cancels, or closes an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    indicators_ok, indicators = _odts_indicator_snapshot()
+    if not indicators_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": indicators.get("error", "Unable to read QQQ indicators."),
+        }), int(indicators.get("status_code", 502) or 502)
+
+    # ----------------------------------------------------------
+    # FROZEN V1 RULES
+    # ----------------------------------------------------------
+    underlying = "QQQ"
+    allowed_dte = {1, 2}
+    spread_width = 2.0
+    long_delta_min = 0.50
+    long_delta_max = 0.65
+    long_delta_mid = (long_delta_min + long_delta_max) / 2.0
+    max_leg_spread_pct = 15.0
+    max_net_debit = 1.00
+    min_reward_risk = 1.00
+    quantity_spreads = 1
+    strike_proximity = 18
+
+    # ----------------------------------------------------------
+    # EXISTING ODTS MARKET/DIRECTION GATES
+    # ----------------------------------------------------------
+    zlema_state = int(indicators.get("zlema_state", 0) or 0)
+    zlema_confirm = int(indicators.get("zlema_confirm", 0) or 0)
+    qqq_close = _odts_float(indicators.get("qqq_close"), None)
+    vwap = _odts_float(indicators.get("vwap"), None)
+    ema21 = _odts_float(indicators.get("ema21"), None)
+    adx14 = _odts_float(indicators.get("adx14"), None)
+
+    if zlema_state > 0:
+        direction = "BULLISH"
+        vertical_type = "BULL CALL"
+        option_type_needed = "CALL"
+    elif zlema_state < 0:
+        direction = "BEARISH"
+        vertical_type = "BEAR PUT"
+        option_type_needed = "PUT"
+    else:
+        direction = "NEUTRAL"
+        vertical_type = ""
+        option_type_needed = ""
+
+    trend_alignment_gate = "WAIT"
+    if (
+        direction == "BULLISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close > vwap
+        and qqq_close > ema21
+    ):
+        trend_alignment_gate = "YES"
+    elif (
+        direction == "BEARISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close < vwap
+        and qqq_close < ema21
+    ):
+        trend_alignment_gate = "YES"
+
+    zlema_confirmation_gate = "YES" if zlema_confirm >= 2 else "WAIT"
+
+    if adx14 is not None and adx14 >= 20.0:
+        adx_gate = "YES"
+    elif adx14 is not None and adx14 >= 15.0:
+        adx_gate = "CAUTION"
+    else:
+        adx_gate = "WAIT"
+
+    dt = now_et()
+    minutes_now = dt.hour * 60 + dt.minute
+    weekday_ok = dt.weekday() <= 4
+    entry_window_open = weekday_ok and (10 * 60) <= minutes_now < (15 * 60)
+    entry_window_gate = "YES" if entry_window_open else "WAIT"
+
+    market_gate_ready = (
+        direction in {"BULLISH", "BEARISH"}
+        and trend_alignment_gate == "YES"
+        and zlema_confirmation_gate == "YES"
+        and adx_gate in {"YES", "CAUTION"}
+    )
+
+    # No need to stream an option chain when the market direction is neutral.
+    if direction == "NEUTRAL":
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "QQQ_VERTICAL_V1",
+            "environment": "SIM",
+            "underlying": underlying,
+            "direction": direction,
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_vertical": None,
+            "gates": {
+                "trend_alignment": trend_alignment_gate,
+                "zlema_confirmation": zlema_confirmation_gate,
+                "adx": adx_gate,
+                "entry_window": entry_window_gate,
+                "vertical_contract": "WAIT",
+                "reward_risk": "WAIT",
+            },
+            "rules": {
+                "spread_width": spread_width,
+                "allowed_dte": sorted(allowed_dte),
+                "long_abs_delta": [long_delta_min, long_delta_max],
+                "max_leg_spread_pct": max_leg_spread_pct,
+                "max_net_debit": max_net_debit,
+                "min_reward_risk": min_reward_risk,
+                "quantity_spreads": quantity_spreads,
+                "entry_window_et": "10:00-15:00",
+                "time_exit_et": "15:45",
+            },
+        }), 200
+
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for candidate in (raw, raw.replace("Z", "+00:00"), raw[:10]):
+            try:
+                return datetime.fromisoformat(candidate).date()
+            except Exception:
+                pass
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(raw[:10], fmt).date()
+            except Exception:
+                pass
+        return None
+
+    def leg_from_item(item, expiration_date, dte):
+        if not isinstance(item, dict):
+            return None
+        if item.get("StreamStatus") or item.get("Error"):
+            return None
+
+        legs = item.get("Legs", [])
+        leg = (
+            legs[0]
+            if isinstance(legs, list)
+            and legs
+            and isinstance(legs[0], dict)
+            else {}
+        )
+
+        option_type = str(
+            item.get("Side") or leg.get("OptionType") or ""
+        ).strip().upper()
+        if option_type != option_type_needed:
+            return None
+
+        strike = safe_float(leg.get("StrikePrice"))
+        if strike is None:
+            strikes = item.get("Strikes", [])
+            if isinstance(strikes, list) and strikes:
+                strike = safe_float(strikes[0])
+        if strike is None:
+            return None
+
+        bid = safe_float(item.get("Bid"))
+        ask = safe_float(item.get("Ask"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+            return None
+
+        mid = safe_float(item.get("Mid"))
+        if mid is None or mid <= 0:
+            mid = (bid + ask) / 2.0
+
+        leg_spread = ask - bid
+        leg_spread_pct = (leg_spread / mid) * 100.0 if mid > 0 else None
+        if leg_spread_pct is None:
+            return None
+
+        delta_raw = safe_float(item.get("Delta"))
+        symbol = str(leg.get("Symbol") or item.get("Symbol") or "").strip()
+
+        return {
+            "symbol": symbol,
+            "option_type": option_type.title(),
+            "expiration": expiration_date.isoformat(),
+            "dte": dte,
+            "strike": round(strike, 4),
+            "bid": round(bid, 4),
+            "ask": round(ask, 4),
+            "mid": round(mid, 4),
+            "spread_pct": round(leg_spread_pct, 4),
+            "delta": round(delta_raw, 6) if delta_raw is not None else "",
+            "abs_delta": round(abs(delta_raw), 6) if delta_raw is not None else "",
+            "volume": safe_int(item.get("Volume"), 0),
+            "open_interest": safe_int(item.get("DailyOpenInterest"), 0),
+        }
+
+    # ----------------------------------------------------------
+    # 1) ELIGIBLE WEEKLY EXPIRATIONS AT EXACTLY 1 OR 2 DTE
+    # ----------------------------------------------------------
+    expiration_url = f"{TS_API_BASE_URL}/marketdata/options/expirations/{underlying}"
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": f"QQQ expiration request failed: {exc}",
+        }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000],
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": "TradeStation expiration response was not valid JSON.",
+        }), 502
+
+    today_et = now_et().date()
+    eligible_expirations = []
+    for expiration_item in (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    ):
+        if not isinstance(expiration_item, dict):
+            continue
+        expiration_date = parse_expiration(expiration_item.get("Date"))
+        if expiration_date is None:
+            continue
+        dte = (expiration_date - today_et).days
+        expiration_type = str(expiration_item.get("Type", "")).strip()
+        if dte in allowed_dte and expiration_type.lower() == "weekly":
+            eligible_expirations.append({
+                "date": expiration_date,
+                "dte": dte,
+                "type": expiration_type,
+            })
+
+    eligible_expirations.sort(key=lambda item: (item["dte"], item["date"]))
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "QQQ_VERTICAL_V1",
+            "environment": "SIM",
+            "underlying": underlying,
+            "direction": direction,
+            "vertical_type": vertical_type,
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_vertical": None,
+            "error": "No QQQ Weekly expiration was found at exactly 1 or 2 calendar DTE.",
+        }), 200
+
+    # ----------------------------------------------------------
+    # 2) CAPTURE SINGLE-LEG SNAPSHOTS AND BUILD $2 VERTICALS
+    # ----------------------------------------------------------
+    chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+    vertical_candidates = []
+    stream_notes = []
+
+    for expiry in eligible_expirations:
+        expiration_date = expiry["date"]
+        chain_params = {
+            "expiration": expiration_date.strftime("%m-%d-%Y"),
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "Call" if option_type_needed == "CALL" else "Put",
+        }
+
+        chain_response = None
+        legs_by_strike = {}
+        message_count = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(5, 5),
+            )
+
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500],
+                })
+                continue
+
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                    break
+
+                message_count += 1
+                leg = leg_from_item(item, expiration_date, expiry["dte"])
+                if leg is not None:
+                    legs_by_strike[round(float(leg["strike"]), 4)] = leg
+
+                if message_count >= 80:
+                    break
+
+        except requests.RequestException as exc:
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": bool(legs_by_strike),
+                "message_count": message_count,
+                "note": str(exc)[:300],
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration") == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+                "leg_count": len(legs_by_strike),
+            })
+
+        for long_strike, long_leg in legs_by_strike.items():
+            long_abs_delta = safe_float(long_leg.get("abs_delta"))
+            if (
+                long_abs_delta is None
+                or not (long_delta_min <= long_abs_delta <= long_delta_max)
+                or safe_float(long_leg.get("spread_pct"), 999.0) > max_leg_spread_pct
+            ):
+                continue
+
+            short_strike = (
+                long_strike + spread_width
+                if direction == "BULLISH"
+                else long_strike - spread_width
+            )
+            short_leg = legs_by_strike.get(round(short_strike, 4))
+            if short_leg is None:
+                continue
+            if safe_float(short_leg.get("spread_pct"), 999.0) > max_leg_spread_pct:
+                continue
+
+            # Conservative executable debit: buy long at Ask, sell short at Bid.
+            net_debit = safe_float(long_leg.get("ask")) - safe_float(short_leg.get("bid"))
+            if net_debit <= 0 or net_debit > max_net_debit:
+                continue
+
+            max_loss_dollars = net_debit * 100.0 * quantity_spreads
+            max_profit_per_share = spread_width - net_debit
+            max_profit_dollars = max_profit_per_share * 100.0 * quantity_spreads
+            reward_risk = (
+                max_profit_dollars / max_loss_dollars
+                if max_loss_dollars > 0
+                else None
+            )
+            if reward_risk is None or reward_risk < min_reward_risk:
+                continue
+
+            profit_exit_spread_price = net_debit + 0.50 * max_profit_per_share
+            protective_exit_spread_price = net_debit * 0.50
+            breakeven = (
+                long_strike + net_debit
+                if direction == "BULLISH"
+                else long_strike - net_debit
+            )
+
+            vertical_candidates.append({
+                "vertical_type": vertical_type,
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "long_leg": long_leg,
+                "short_leg": short_leg,
+                "spread_width": round(spread_width, 2),
+                "net_debit": round(net_debit, 4),
+                "cost_dollars": round(max_loss_dollars, 2),
+                "max_loss_dollars": round(max_loss_dollars, 2),
+                "max_profit_dollars": round(max_profit_dollars, 2),
+                "reward_risk": round(reward_risk, 4),
+                "breakeven": round(breakeven, 4),
+                "profit_exit_rule": "+50% OF MAXIMUM POSSIBLE PROFIT",
+                "profit_exit_spread_price": round(profit_exit_spread_price, 4),
+                "protective_exit_rule": "-50% OF ORIGINAL NET DEBIT",
+                "protective_exit_spread_price": round(protective_exit_spread_price, 4),
+                "time_exit_et": "15:45",
+                "quantity_spreads": quantity_spreads,
+                "delta_distance": round(abs(long_abs_delta - long_delta_mid), 8),
+            })
+
+    # Step 5 frozen rule: compare 1-DTE and 2-DTE qualified spreads and
+    # choose the better reward:risk. Delta closeness is only a tie-breaker.
+    vertical_candidates.sort(
+        key=lambda item: (
+            -float(item["reward_risk"]),
+            float(item["delta_distance"]),
+            int(item["dte"]),
+        )
+    )
+    selected_vertical = vertical_candidates[0] if vertical_candidates else None
+
+    vertical_contract_gate = "YES" if selected_vertical else "WAIT"
+    reward_risk_gate = (
+        "YES"
+        if selected_vertical
+        and float(selected_vertical.get("reward_risk", 0)) >= min_reward_risk
+        else "WAIT"
+    )
+
+    setup_ready = (
+        market_gate_ready
+        and entry_window_gate == "YES"
+        and vertical_contract_gate == "YES"
+        and reward_risk_gate == "YES"
+    )
+
+    decision = vertical_type if setup_ready else "WAIT"
+    approval_status = "READY FOR PROPOSAL" if setup_ready else "WAIT"
+
+    # Remove internal tie-break field from user-facing selected result.
+    if selected_vertical:
+        selected_vertical = dict(selected_vertical)
+        selected_vertical.pop("delta_distance", None)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "project": "QQQ_VERTICAL_V1",
+        "environment": "SIM",
+        "underlying": underlying,
+        "bar_timestamp": indicators.get("bar_timestamp", ""),
+        "qqq_close": indicators.get("qqq_close", ""),
+        "ema21": indicators.get("ema21", ""),
+        "vwap": indicators.get("vwap", ""),
+        "adx14": indicators.get("adx14", ""),
+        "zlema_state": zlema_state,
+        "zlema_confirm": zlema_confirm,
+        "direction": direction,
+        "vertical_type": vertical_type,
+        "decision": decision,
+        "approval_status": approval_status,
+        "selected_vertical": selected_vertical,
+        "qualified_vertical_count": len(vertical_candidates),
+        "gates": {
+            "trend_alignment": trend_alignment_gate,
+            "zlema_confirmation": zlema_confirmation_gate,
+            "adx": adx_gate,
+            "entry_window": entry_window_gate,
+            "vertical_contract": vertical_contract_gate,
+            "reward_risk": reward_risk_gate,
+        },
+        "rules": {
+            "expiration_type": "Weekly",
+            "allowed_dte": sorted(allowed_dte),
+            "long_abs_delta": [long_delta_min, long_delta_max],
+            "short_leg_rule": "$2 away from long strike, same expiration",
+            "spread_width": spread_width,
+            "max_leg_spread_pct": max_leg_spread_pct,
+            "net_debit_rule": ">$0 and <=$1.00",
+            "max_net_debit": max_net_debit,
+            "min_reward_risk": min_reward_risk,
+            "quantity_spreads": quantity_spreads,
+            "entry_window_et": "10:00-15:00",
+            "profit_exit": "+50% of maximum possible profit",
+            "protective_exit": "-50% of original net debit",
+            "time_exit_et": "15:45",
+            "hold_through_expiration": False,
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "stream_notes": stream_notes,
+        "safety": "READ ONLY - NO ORDER CAPABILITY IN THIS ROUTE",
+        "next_step": (
+            "Verify #10 selector output against TradeStation OptionStation Pro. "
+            "Do not add APPROVE/PASS or execution until validation is complete."
+        ),
+    }), 200
+
+
 # ==============================================================
 # START SERVER
 # ==============================================================
