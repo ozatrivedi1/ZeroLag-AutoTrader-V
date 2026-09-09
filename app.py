@@ -7092,6 +7092,653 @@ def odts_vertical_test():
     }), 200
 
 
+
+# ==============================================================
+# #11 NVDA COVERED CALL V1 - APPROVAL DOCUMENT / GATEKEEPER
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-approval")
+def odts_nvda_covered_call_approval():
+    """
+    NVDA Covered Call V1 read-only approval document.
+
+    Frozen V1 rules:
+      - Underlying NVDA; 100 shares covered; 1 call contract
+      - SELL TO OPEN CALL (display only in this route)
+      - OTM strike only
+      - 7 to 21 calendar DTE
+      - absolute Delta 0.20 to 0.30
+      - IVX percentile gate:
+          <25 WAIT; 25-<50 CAUTION; 50-80 YES; >80 CAUTION/EVENT CHECK
+      - Premium return on current stock value:
+          >=1.00% YES; 0.60-<1.00% CAUTION; <0.60% WAIT
+      - Assignment strike above cost basis and acceptable sale price
+      - Event gate: no major event before expiry = YES; event = CAUTION;
+        IVX >80 plus event = WAIT
+      - Liquidity: <=10% spread YES; >10% to <=15% CAUTION; >15% rejected
+      - Volume and open interest are displayed, with no hard minimum in V1
+      - Final Decision: YES / CAUTION / WAIT
+      - Only YES may later become eligible for human APPROVE/PASS
+
+    Current implementation intentionally keeps IVX percentile and event status
+    as explicit approval inputs because the existing TradeStation feed in this
+    service does not provide a validated historical IVX-percentile series or an
+    earnings/event calendar.  Optional query inputs:
+      ?ivx_percentile=65
+      &event_before_expiration=NO
+      &cost_basis=210
+      &min_assignment_price=210
+
+    This route NEVER submits, modifies, cancels, or closes an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    # ----------------------------------------------------------
+    # FROZEN V1 RULES / INPUTS
+    # ----------------------------------------------------------
+    underlying = "NVDA"
+    shares_covered = 100
+    contracts = 1
+    allowed_dte_min = 7
+    allowed_dte_max = 21
+    delta_min = 0.20
+    delta_max = 0.30
+    delta_mid = (delta_min + delta_max) / 2.0
+    preferred_spread_pct = 10.0
+    max_spread_pct = 15.0
+    premium_yes_pct = 1.00
+    premium_caution_pct = 0.60
+    strike_proximity = 40
+
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for candidate in (raw, raw.replace("Z", "+00:00"), raw[:10]):
+            try:
+                return datetime.fromisoformat(candidate).date()
+            except Exception:
+                pass
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(raw[:10], fmt).date()
+            except Exception:
+                pass
+        return None
+
+    cost_basis = safe_float(request.args.get("cost_basis", "210"), 210.0)
+    min_assignment_price = safe_float(
+        request.args.get("min_assignment_price", str(cost_basis)),
+        cost_basis,
+    )
+    ivx_percentile = safe_float(request.args.get("ivx_percentile"), None)
+    event_raw = str(
+        request.args.get("event_before_expiration", "UNKNOWN")
+    ).strip().upper()
+    if event_raw in {"N", "FALSE", "0", "NONE"}:
+        event_raw = "NO"
+    elif event_raw in {"Y", "TRUE", "1"}:
+        event_raw = "YES"
+    if event_raw not in {"YES", "NO", "UNKNOWN"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "event_before_expiration must be YES, NO, or UNKNOWN",
+        }), 400
+
+    # ----------------------------------------------------------
+    # UNDERLYING QUOTE - READ ONLY
+    # ----------------------------------------------------------
+    quote_url = (
+        f"{TS_API_BASE_URL}/marketdata/stream/quotes/"
+        f"{requests.utils.quote(underlying, safe='')}"
+    )
+    quote_response = None
+    nvda_quote = {}
+    try:
+        quote_response = requests.get(
+            quote_url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=(5, 6),
+        )
+        if not quote_response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "approval_enabled": False,
+                "project": "NVDA_COVERED_CALL_V1",
+                "status_code": quote_response.status_code,
+                "response": quote_response.text[:1000],
+            }), quote_response.status_code
+
+        for line in quote_response.iter_lines():
+            if not line:
+                continue
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if item.get("StreamStatus") or item.get("Error"):
+                continue
+            nvda_quote = item
+            break
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": f"NVDA quote request failed: {exc}",
+        }), 502
+    finally:
+        if quote_response is not None:
+            try:
+                quote_response.close()
+            except Exception:
+                pass
+
+    stock_price = safe_float(nvda_quote.get("Last"))
+    if stock_price is None or stock_price <= 0:
+        stock_bid = safe_float(nvda_quote.get("Bid"))
+        stock_ask = safe_float(nvda_quote.get("Ask"))
+        if stock_bid is not None and stock_ask is not None:
+            stock_price = (stock_bid + stock_ask) / 2.0
+
+    if stock_price is None or stock_price <= 0:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "A valid NVDA stock price was not returned.",
+        }), 502
+
+    # ----------------------------------------------------------
+    # IVX GATE - EXPLICIT INPUT UNTIL A VALIDATED IVX FEED EXISTS
+    # ----------------------------------------------------------
+    ivx_gate = "WAIT"
+    ivx_note = "IVX percentile input required"
+    if ivx_percentile is not None:
+        if ivx_percentile < 0 or ivx_percentile > 100:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "approval_enabled": False,
+                "project": "NVDA_COVERED_CALL_V1",
+                "error": "ivx_percentile must be between 0 and 100",
+            }), 400
+        if ivx_percentile < 25:
+            ivx_gate = "WAIT"
+            ivx_note = "Low IVX percentile"
+        elif ivx_percentile < 50:
+            ivx_gate = "CAUTION"
+            ivx_note = "Normal IVX percentile"
+        elif ivx_percentile <= 80:
+            ivx_gate = "YES"
+            ivx_note = "Preferred elevated IVX zone"
+        else:
+            ivx_gate = "CAUTION"
+            ivx_note = "Very high IVX - event check required"
+
+    # ----------------------------------------------------------
+    # EXPIRATIONS - 7 TO 21 CALENDAR DTE
+    # ----------------------------------------------------------
+    expiration_url = f"{TS_API_BASE_URL}/marketdata/options/expirations/{underlying}"
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": f"NVDA expiration request failed: {exc}",
+        }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000],
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "TradeStation expiration response was not valid JSON.",
+        }), 502
+
+    today_et = now_et().date()
+    expirations = (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    )
+    eligible_expirations = []
+    if isinstance(expirations, list):
+        for expiration_item in expirations:
+            if isinstance(expiration_item, dict):
+                raw_date = (
+                    expiration_item.get("Date")
+                    or expiration_item.get("ExpirationDate")
+                    or expiration_item.get("Expiration")
+                )
+                expiration_type = str(
+                    expiration_item.get("Type")
+                    or expiration_item.get("ExpirationType")
+                    or ""
+                ).strip()
+            else:
+                raw_date = expiration_item
+                expiration_type = ""
+
+            expiration_date = parse_expiration(raw_date)
+            if expiration_date is None:
+                continue
+            dte = (expiration_date - today_et).days
+            if allowed_dte_min <= dte <= allowed_dte_max:
+                eligible_expirations.append({
+                    "date": expiration_date,
+                    "dte": dte,
+                    "type": expiration_type,
+                })
+
+    eligible_expirations.sort(key=lambda item: (item["dte"], item["date"]))
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "environment": "SIM",
+            "stock": underlying,
+            "stock_price": round(stock_price, 4),
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_call": None,
+            "error": "No NVDA expiration was found between 7 and 21 calendar DTE.",
+        }), 200
+
+    # ----------------------------------------------------------
+    # SCAN CALL CHAINS AND BUILD APPROVAL CANDIDATES
+    # ----------------------------------------------------------
+    chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+    candidates = []
+    stream_notes = []
+
+    for expiry in eligible_expirations:
+        expiration_date = expiry["date"]
+        chain_params = {
+            "expiration": expiration_date.strftime("%m-%d-%Y"),
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "Call",
+        }
+
+        chain_response = None
+        message_count = 0
+        candidate_count_for_expiry = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(5, 6),
+            )
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500],
+                })
+                continue
+
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                    break
+                if item.get("Error"):
+                    continue
+
+                message_count += 1
+                legs = item.get("Legs", [])
+                leg = (
+                    legs[0]
+                    if isinstance(legs, list)
+                    and legs
+                    and isinstance(legs[0], dict)
+                    else {}
+                )
+                option_type = str(
+                    item.get("Side") or leg.get("OptionType") or ""
+                ).strip().upper()
+                if option_type != "CALL":
+                    continue
+
+                strike = safe_float(leg.get("StrikePrice"))
+                if strike is None:
+                    strikes = item.get("Strikes", [])
+                    if isinstance(strikes, list) and strikes:
+                        strike = safe_float(strikes[0])
+                if strike is None or strike <= stock_price:
+                    continue
+
+                delta_raw = safe_float(item.get("Delta"))
+                if delta_raw is None:
+                    continue
+                abs_delta = abs(delta_raw)
+                if not (delta_min <= abs_delta <= delta_max):
+                    continue
+
+                bid = safe_float(item.get("Bid"))
+                ask = safe_float(item.get("Ask"))
+                if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+                    continue
+
+                mid = safe_float(item.get("Mid"))
+                if mid is None or mid <= 0:
+                    mid = (bid + ask) / 2.0
+                option_spread = ask - bid
+                spread_pct = (option_spread / mid) * 100.0 if mid > 0 else None
+                if spread_pct is None or spread_pct > max_spread_pct:
+                    continue
+
+                premium_credit_dollars = bid * 100.0 * contracts
+                stock_value = stock_price * shares_covered
+                premium_return_pct = (
+                    (premium_credit_dollars / stock_value) * 100.0
+                    if stock_value > 0
+                    else 0.0
+                )
+
+                if spread_pct <= preferred_spread_pct:
+                    liquidity_gate = "YES"
+                else:
+                    liquidity_gate = "CAUTION"
+
+                if premium_return_pct >= premium_yes_pct:
+                    premium_gate = "YES"
+                elif premium_return_pct >= premium_caution_pct:
+                    premium_gate = "CAUTION"
+                else:
+                    premium_gate = "WAIT"
+
+                assignment_gate = (
+                    "YES"
+                    if strike > cost_basis and strike >= min_assignment_price
+                    else "WAIT"
+                )
+
+                event_gate = "WAIT"
+                event_note = "Event status not supplied"
+                if event_raw == "NO":
+                    event_gate = "YES"
+                    event_note = "No major event before expiration"
+                elif event_raw == "YES":
+                    if ivx_percentile is not None and ivx_percentile > 80:
+                        event_gate = "WAIT"
+                        event_note = "Very high IVX plus major event"
+                    else:
+                        event_gate = "CAUTION"
+                        event_note = "Major event before expiration"
+
+                stock_gain_if_assigned = (strike - cost_basis) * shares_covered
+                total_gain_if_assigned = stock_gain_if_assigned + premium_credit_dollars
+                breakeven = cost_basis - bid
+                upside_to_strike_pct = ((strike / stock_price) - 1.0) * 100.0
+
+                gates = {
+                    "dte": "YES",
+                    "delta": "YES",
+                    "ivx": ivx_gate,
+                    "premium_return": premium_gate,
+                    "assignment": assignment_gate,
+                    "event": event_gate,
+                    "liquidity": liquidity_gate,
+                }
+
+                gate_values = list(gates.values())
+                if "WAIT" in gate_values:
+                    final_decision = "WAIT"
+                elif "CAUTION" in gate_values:
+                    final_decision = "CAUTION"
+                else:
+                    final_decision = "YES"
+
+                symbol = str(
+                    leg.get("Symbol") or item.get("Symbol") or ""
+                ).strip()
+                candidate = {
+                    "symbol": symbol,
+                    "option_type": "Call",
+                    "action": "SELL TO OPEN",
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "strike": round(strike, 4),
+                    "delta": round(delta_raw, 6),
+                    "abs_delta": round(abs_delta, 6),
+                    "bid": round(bid, 4),
+                    "ask": round(ask, 4),
+                    "mid": round(mid, 4),
+                    "spread_pct": round(spread_pct, 4),
+                    "volume": safe_int(item.get("Volume"), 0),
+                    "open_interest": safe_int(item.get("DailyOpenInterest"), 0),
+                    "contract_implied_volatility": safe_float(
+                        item.get("ImpliedVolatility"), ""
+                    ),
+                    "premium_credit_dollars": round(premium_credit_dollars, 2),
+                    "premium_return_pct": round(premium_return_pct, 4),
+                    "breakeven_cost_basis_after_premium": round(breakeven, 4),
+                    "stock_gain_if_assigned_dollars": round(stock_gain_if_assigned, 2),
+                    "total_gain_if_assigned_dollars": round(total_gain_if_assigned, 2),
+                    "upside_to_strike_pct": round(upside_to_strike_pct, 4),
+                    "gates": gates,
+                    "decision": final_decision,
+                    "event_note": event_note,
+                    "delta_distance": round(abs(abs_delta - delta_mid), 8),
+                }
+                candidates.append(candidate)
+                candidate_count_for_expiry += 1
+
+                if message_count >= 160:
+                    break
+
+        except requests.RequestException as exc:
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": candidate_count_for_expiry > 0,
+                "message_count": message_count,
+                "note": str(exc)[:300],
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration") == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+                "candidate_count": candidate_count_for_expiry,
+            })
+
+    # Rank YES first, then CAUTION, then WAIT; within each bucket prefer
+    # premium return, tighter spread, and Delta closest to midpoint.
+    decision_rank = {"YES": 0, "CAUTION": 1, "WAIT": 2}
+    candidates.sort(
+        key=lambda item: (
+            decision_rank.get(item.get("decision"), 9),
+            -float(item.get("premium_return_pct", 0.0)),
+            float(item.get("spread_pct", 999.0)),
+            float(item.get("delta_distance", 999.0)),
+            int(item.get("dte", 999)),
+        )
+    )
+    selected_call = dict(candidates[0]) if candidates else None
+    if selected_call:
+        selected_call.pop("delta_distance", None)
+
+    final_decision = selected_call.get("decision") if selected_call else "WAIT"
+    approval_status = (
+        "ELIGIBLE FOR HUMAN APPROVE/PASS"
+        if final_decision == "YES"
+        else final_decision
+    )
+
+    # Approval remains disabled in #11. This document can only display the
+    # future approval eligibility state; it has no order-capable function.
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "project": "NVDA_COVERED_CALL_V1",
+        "environment": "SIM",
+        "stock": underlying,
+        "shares_covered": shares_covered,
+        "contracts": contracts,
+        "stock_price": round(stock_price, 4),
+        "cost_basis_per_share": round(cost_basis, 4),
+        "minimum_acceptable_assignment_price": round(min_assignment_price, 4),
+        "ivx_percentile": (
+            round(ivx_percentile, 4) if ivx_percentile is not None else ""
+        ),
+        "ivx_gate": ivx_gate,
+        "ivx_note": ivx_note,
+        "event_before_expiration": event_raw,
+        "decision": final_decision,
+        "approval_status": approval_status,
+        "selected_call": selected_call,
+        "qualified_contract_count": len(candidates),
+        "rules": {
+            "position": "100 NVDA shares covered by 1 call",
+            "action": "SELL TO OPEN CALL",
+            "otm_only": True,
+            "allowed_dte": [allowed_dte_min, allowed_dte_max],
+            "abs_delta": [delta_min, delta_max],
+            "ivx_percentile": {
+                "below_25": "WAIT",
+                "25_to_below_50": "CAUTION",
+                "50_to_80": "YES",
+                "above_80": "CAUTION / EVENT CHECK",
+            },
+            "premium_return_pct": {
+                "yes": ">=1.00%",
+                "caution": "0.60% to <1.00%",
+                "wait": "<0.60%",
+            },
+            "assignment": "Strike must be above cost basis and acceptable sale price",
+            "event": "No event=YES; event=CAUTION; IVX>80 + event=WAIT",
+            "liquidity": {
+                "preferred": "<=10% Bid/Ask spread",
+                "caution": ">10% to <=15%",
+                "wait": ">15% or invalid quote",
+            },
+            "volume_open_interest": "DISPLAY ONLY - NO HARD V1 MINIMUM",
+            "human_control": "APPROVE / PASS only after a future execution phase",
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "stream_notes": stream_notes,
+        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11",
+        "input_note": (
+            "Until a validated automatic IVX-percentile and event-calendar feed is "
+            "connected, supply ivx_percentile and event_before_expiration in the URL."
+        ),
+        "example_url_suffix": (
+            "/odts-nvda-covered-call-approval?ivx_percentile=65"
+            "&event_before_expiration=NO&cost_basis=210&min_assignment_price=210"
+        ),
+        "next_step": (
+            "Validate #11 approval output against the live NVDA option chain. "
+            "Do not add covered-call execution until the approval document is verified."
+        ),
+    }), 200
+
 # ==============================================================
 # START SERVER
 # ==============================================================
