@@ -7877,3 +7877,125 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
+
+# ==============================================================
+# NVDA COVERED CALL - IV PERCENTILE API DISCOVERY #13
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+@app.get("/odts-nvda-iv-percentile-test")
+def odts_nvda_iv_percentile_test():
+    """Inspect live TradeStation v3 payloads for a native IV percentile/rank field."""
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_IV_PERCENTILE_DISCOVERY_13",
+            "error": error, "next_step": "Open /login",
+        }), 401
+
+    underlying = "NVDA"
+
+    def clean_keys(payload):
+        return sorted(str(k) for k in payload.keys()) if isinstance(payload, dict) else []
+
+    def percentile_like_fields(payload):
+        if not isinstance(payload, dict):
+            return {}
+        result = {}
+        for key, value in payload.items():
+            name = str(key).lower().replace("_", "").replace("-", "")
+            if ("percentile" in name or "ivrank" in name
+                    or "volatilityrank" in name or "ivpercent" in name):
+                result[str(key)] = value
+        return result
+
+    quote_payload, quote_error, quote_response = {}, None, None
+    try:
+        quote_url = f"{TS_API_BASE_URL}/marketdata/stream/quotes/{requests.utils.quote(underlying, safe='')}"
+        quote_response = requests.get(
+            quote_url, headers=ts_headers(access_token),
+            stream=True, timeout=(3, 4)
+        )
+        if quote_response.ok:
+            for line in quote_response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line.decode("utf-8", errors="replace").strip())
+                except ValueError:
+                    continue
+                if item.get("StreamStatus") or item.get("Error"):
+                    continue
+                quote_payload = item
+                break
+        else:
+            quote_error = f"HTTP {quote_response.status_code}: {quote_response.text[:500]}"
+    except requests.RequestException as exc:
+        quote_error = str(exc)
+    finally:
+        if quote_response is not None:
+            try:
+                quote_response.close()
+            except Exception:
+                pass
+
+    chain_payload, chain_error, chain_response = {}, None, None
+    try:
+        chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+        chain_response = requests.get(
+            chain_url, headers=ts_headers(access_token),
+            params={
+                "strikeProximity": 5, "spreadType": "Single",
+                "enableGreeks": "true", "optionType": "Call",
+            },
+            stream=True, timeout=(3, 4)
+        )
+        if chain_response.ok:
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line.decode("utf-8", errors="replace").strip())
+                except ValueError:
+                    continue
+                if item.get("StreamStatus") or item.get("Error"):
+                    continue
+                chain_payload = item
+                break
+        else:
+            chain_error = f"HTTP {chain_response.status_code}: {chain_response.text[:500]}"
+    except requests.RequestException as exc:
+        chain_error = str(exc)
+    finally:
+        if chain_response is not None:
+            try:
+                chain_response.close()
+            except Exception:
+                pass
+
+    quote_fields = percentile_like_fields(quote_payload)
+    chain_fields = percentile_like_fields(chain_payload)
+    native_found = bool(quote_fields or chain_fields)
+
+    return jsonify({
+        "ok": True, "read_only": True, "order_sent": False,
+        "approval_enabled": False,
+        "project": "NVDA_COVERED_CALL_IV_PERCENTILE_DISCOVERY_13",
+        "stock": underlying,
+        "native_iv_percentile_field_found": native_found,
+        "quote_percentile_like_fields": quote_fields,
+        "option_chain_percentile_like_fields": chain_fields,
+        "quote_payload_keys": clean_keys(quote_payload),
+        "option_chain_payload_keys": clean_keys(chain_payload),
+        "quote_error": quote_error or "",
+        "option_chain_error": chain_error or "",
+        "contract_implied_volatility": chain_payload.get("ImpliedVolatility", "") if isinstance(chain_payload, dict) else "",
+        "interpretation": (
+            "Native IV percentile/rank field found. Validate its scale before using it."
+            if native_found else
+            "No native IV percentile/rank field found in the sampled TradeStation v3 quote or option-chain payload. Do not substitute contract ImpliedVolatility for IV Percentile."
+        ),
+        "safety": "READ ONLY diagnostic. No covered-call, QQQ, SOXL, or other order function is called.",
+    }), 200
