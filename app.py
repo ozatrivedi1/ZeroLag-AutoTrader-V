@@ -7094,14 +7094,14 @@ def odts_vertical_test():
 
 
 # ==============================================================
-# #11A NVDA COVERED CALL V1 - APPROVAL DOCUMENT / GATEKEEPER TIMEOUT FIX
+# #11F NVDA COVERED CALL V1 - FLAT SELECTED-CALL FEED / TIMEOUT SAFE
 # READ ONLY / NO ORDER SUBMISSION
 # ==============================================================
 
 @app.get("/odts-nvda-covered-call-approval")
 def odts_nvda_covered_call_approval():
     """
-    NVDA Covered Call V1 read-only approval document (#11A timeout-safe).
+    NVDA Covered Call V1 read-only approval document (#11F flat-feed, timeout-safe).
 
     Frozen V1 rules:
       - Underlying NVDA; 100 shares covered; 1 call contract
@@ -7727,6 +7727,88 @@ def odts_nvda_covered_call_approval():
             "chain_read_timeout_seconds": 3,
         },
         "selected_call": selected_call,
+
+        # #11F Excel-friendly flattened selected-call fields.
+        # These duplicate the same READ-ONLY selected_call values above so
+        # Excel/Power Query can consume them directly without expanding a
+        # nested JSON Record. No order capability is added by these fields.
+        "selected_call_symbol": (
+            selected_call.get("symbol", "") if selected_call else ""
+        ),
+        "selected_call_option_type": (
+            selected_call.get("option_type", "") if selected_call else ""
+        ),
+        "selected_call_action": (
+            selected_call.get("action", "") if selected_call else ""
+        ),
+        "selected_call_expiration": (
+            selected_call.get("expiration", "") if selected_call else ""
+        ),
+        "selected_call_dte": (
+            selected_call.get("dte", "") if selected_call else ""
+        ),
+        "selected_call_strike": (
+            selected_call.get("strike", "") if selected_call else ""
+        ),
+        "selected_call_delta": (
+            selected_call.get("delta", "") if selected_call else ""
+        ),
+        "selected_call_abs_delta": (
+            selected_call.get("abs_delta", "") if selected_call else ""
+        ),
+        "selected_call_bid": (
+            selected_call.get("bid", "") if selected_call else ""
+        ),
+        "selected_call_ask": (
+            selected_call.get("ask", "") if selected_call else ""
+        ),
+        "selected_call_mid": (
+            selected_call.get("mid", "") if selected_call else ""
+        ),
+        "selected_call_spread_pct": (
+            selected_call.get("spread_pct", "") if selected_call else ""
+        ),
+        "selected_call_volume": (
+            selected_call.get("volume", "") if selected_call else ""
+        ),
+        "selected_call_open_interest": (
+            selected_call.get("open_interest", "") if selected_call else ""
+        ),
+        "selected_call_contract_iv": (
+            selected_call.get("contract_implied_volatility", "")
+            if selected_call else ""
+        ),
+        "selected_call_premium_credit_dollars": (
+            selected_call.get("premium_credit_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_premium_return_pct": (
+            selected_call.get("premium_return_pct", "")
+            if selected_call else ""
+        ),
+        "selected_call_breakeven": (
+            selected_call.get("breakeven_cost_basis_after_premium", "")
+            if selected_call else ""
+        ),
+        "selected_call_stock_gain_if_assigned_dollars": (
+            selected_call.get("stock_gain_if_assigned_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_total_gain_if_assigned_dollars": (
+            selected_call.get("total_gain_if_assigned_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_upside_to_strike_pct": (
+            selected_call.get("upside_to_strike_pct", "")
+            if selected_call else ""
+        ),
+        "selected_call_decision": (
+            selected_call.get("decision", "") if selected_call else ""
+        ),
+        "selected_call_event_note": (
+            selected_call.get("event_note", "") if selected_call else ""
+        ),
+
         "qualified_contract_count": len(candidates),
         "rules": {
             "position": "100 NVDA shares covered by 1 call",
@@ -7764,7 +7846,7 @@ def odts_nvda_covered_call_approval():
             for item in eligible_expirations
         ],
         "stream_notes": stream_notes,
-        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11A",
+        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11F",
         "input_note": (
             "Until a validated automatic IVX-percentile and event-calendar feed is "
             "connected, supply ivx_percentile and event_before_expiration in the URL."
@@ -7774,7 +7856,7 @@ def odts_nvda_covered_call_approval():
             "&event_before_expiration=NO&cost_basis=210&min_assignment_price=210"
         ),
         "next_step": (
-            "Validate #11A timeout-safe approval output against the live NVDA option chain. "
+            "Validate #11F flat selected-call output against the live NVDA option chain. "
             "Do not add covered-call execution until the approval document is verified."
         ),
     }), 200
