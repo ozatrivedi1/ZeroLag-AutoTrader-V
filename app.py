@@ -7094,14 +7094,14 @@ def odts_vertical_test():
 
 
 # ==============================================================
-# #11 NVDA COVERED CALL V1 - APPROVAL DOCUMENT / GATEKEEPER
+# #11A NVDA COVERED CALL V1 - APPROVAL DOCUMENT / GATEKEEPER TIMEOUT FIX
 # READ ONLY / NO ORDER SUBMISSION
 # ==============================================================
 
 @app.get("/odts-nvda-covered-call-approval")
 def odts_nvda_covered_call_approval():
     """
-    NVDA Covered Call V1 read-only approval document.
+    NVDA Covered Call V1 read-only approval document (#11A timeout-safe).
 
     Frozen V1 rules:
       - Underlying NVDA; 100 shares covered; 1 call contract
@@ -7231,7 +7231,7 @@ def odts_nvda_covered_call_approval():
             quote_url,
             headers=ts_headers(access_token),
             stream=True,
-            timeout=(5, 6),
+            timeout=(3, 4),
         )
         if not quote_response.ok:
             return jsonify({
@@ -7327,7 +7327,7 @@ def odts_nvda_covered_call_approval():
         expiration_response = requests.get(
             expiration_url,
             headers=ts_headers(access_token),
-            timeout=20,
+            timeout=8,
         )
     except requests.RequestException as exc:
         return jsonify({
@@ -7422,7 +7422,21 @@ def odts_nvda_covered_call_approval():
     candidates = []
     stream_notes = []
 
+    # #11A reliability guardrails. These do not change the frozen trading
+    # rules; they only prevent a slow TradeStation stream from holding the
+    # HTTP request open indefinitely. A partial scan can DISPLAY candidates,
+    # but it can never return approval eligibility.
+    scan_started = time.monotonic()
+    scan_deadline_seconds = 15.0
+    max_messages_per_expiry = 80
+    scan_truncated = False
+    truncation_reason = ""
+
     for expiry in eligible_expirations:
+        if time.monotonic() - scan_started >= scan_deadline_seconds:
+            scan_truncated = True
+            truncation_reason = "TOTAL_SCAN_DEADLINE"
+            break
         expiration_date = expiry["date"]
         chain_params = {
             "expiration": expiration_date.strftime("%m-%d-%Y"),
@@ -7442,7 +7456,7 @@ def odts_nvda_covered_call_approval():
                 headers=ts_headers(access_token),
                 params=chain_params,
                 stream=True,
-                timeout=(5, 6),
+                timeout=(3, 3),
             )
             if not chain_response.ok:
                 stream_notes.append({
@@ -7455,6 +7469,10 @@ def odts_nvda_covered_call_approval():
                 continue
 
             for line in chain_response.iter_lines():
+                if time.monotonic() - scan_started >= scan_deadline_seconds:
+                    scan_truncated = True
+                    truncation_reason = "TOTAL_SCAN_DEADLINE"
+                    break
                 if not line:
                     continue
                 raw = line.decode("utf-8", errors="replace").strip()
@@ -7610,7 +7628,7 @@ def odts_nvda_covered_call_approval():
                 candidates.append(candidate)
                 candidate_count_for_expiry += 1
 
-                if message_count >= 160:
+                if message_count >= max_messages_per_expiry:
                     break
 
         except requests.RequestException as exc:
@@ -7640,6 +7658,11 @@ def odts_nvda_covered_call_approval():
                 "candidate_count": candidate_count_for_expiry,
             })
 
+        if scan_truncated:
+            break
+
+    scan_elapsed_seconds = round(time.monotonic() - scan_started, 3)
+
     # Rank YES first, then CAUTION, then WAIT; within each bucket prefer
     # premium return, tighter spread, and Delta closest to midpoint.
     decision_rank = {"YES": 0, "CAUTION": 1, "WAIT": 2}
@@ -7656,12 +7679,18 @@ def odts_nvda_covered_call_approval():
     if selected_call:
         selected_call.pop("delta_distance", None)
 
-    final_decision = selected_call.get("decision") if selected_call else "WAIT"
-    approval_status = (
-        "ELIGIBLE FOR HUMAN APPROVE/PASS"
-        if final_decision == "YES"
-        else final_decision
-    )
+    candidate_decision = selected_call.get("decision") if selected_call else "WAIT"
+    final_decision = candidate_decision
+    if scan_truncated:
+        # Safety: a partial option-chain scan is never approval-eligible.
+        final_decision = "WAIT"
+        approval_status = "WAIT - PARTIAL CHAIN SCAN"
+    else:
+        approval_status = (
+            "ELIGIBLE FOR HUMAN APPROVE/PASS"
+            if final_decision == "YES"
+            else final_decision
+        )
 
     # Approval remains disabled in #11. This document can only display the
     # future approval eligibility state; it has no order-capable function.
@@ -7685,7 +7714,18 @@ def odts_nvda_covered_call_approval():
         "ivx_note": ivx_note,
         "event_before_expiration": event_raw,
         "decision": final_decision,
+        "candidate_decision": candidate_decision,
         "approval_status": approval_status,
+        "scan_complete": not scan_truncated,
+        "scan_truncated": scan_truncated,
+        "scan_truncation_reason": truncation_reason,
+        "scan_elapsed_seconds": scan_elapsed_seconds,
+        "scan_limits": {
+            "total_deadline_seconds": scan_deadline_seconds,
+            "max_messages_per_expiry": max_messages_per_expiry,
+            "chain_connect_timeout_seconds": 3,
+            "chain_read_timeout_seconds": 3,
+        },
         "selected_call": selected_call,
         "qualified_contract_count": len(candidates),
         "rules": {
@@ -7724,7 +7764,7 @@ def odts_nvda_covered_call_approval():
             for item in eligible_expirations
         ],
         "stream_notes": stream_notes,
-        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11",
+        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11A",
         "input_note": (
             "Until a validated automatic IVX-percentile and event-calendar feed is "
             "connected, supply ivx_percentile and event_before_expiration in the URL."
@@ -7734,7 +7774,7 @@ def odts_nvda_covered_call_approval():
             "&event_before_expiration=NO&cost_basis=210&min_assignment_price=210"
         ),
         "next_step": (
-            "Validate #11 approval output against the live NVDA option chain. "
+            "Validate #11A timeout-safe approval output against the live NVDA option chain. "
             "Do not add covered-call execution until the approval document is verified."
         ),
     }), 200
