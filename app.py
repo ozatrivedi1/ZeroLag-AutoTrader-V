@@ -7865,6 +7865,134 @@ def odts_nvda_covered_call_approval():
 # START SERVER
 # ==============================================================
 
+
+
+# ==============================================================
+# #14 NVDA EULERPOOL IV PERCENTILE CONNECTION TEST
+# READ ONLY / NO ORDER SUBMISSION / NO EXISTING LOGIC CHANGED
+# ==============================================================
+@app.get("/odts-nvda-eulerpool-iv-percentile-test")
+def odts_nvda_eulerpool_iv_percentile_test():
+    """
+    Diagnostic-only test of the Eulerpool IV Rank / IV Percentile endpoint.
+
+    Safety:
+    - Reads EULERPOOL_API_KEY only from Render environment variables.
+    - Never returns the API key.
+    - Does not call TradeStation order functions.
+    - Does not alter the existing covered-call approval endpoint.
+    - Does not alter SOXL or QQQ logic.
+    """
+    api_key = os.getenv("EULERPOOL_API_KEY", "").strip()
+    symbol = "NVDA"
+    url = f"https://api.eulerpool.com/v1/volatility/{symbol}/iv-rank"
+
+    if not api_key:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": False,
+            "error": "EULERPOOL_API_KEY is not configured in Render.",
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), 500
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "ZeroLag-AutoTrader-V/ODTS-NVDA-IV-Test"
+            },
+            timeout=(5, 10)
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": True,
+            "error": f"Eulerpool request failed: {exc}",
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), 502
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": True,
+            "status_code": response.status_code,
+            "provider_response": (
+                body if body is not None else response.text[:1000]
+            ),
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), response.status_code
+
+    def find_iv_fields(value, path=""):
+        found = {}
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                normalized = "".join(
+                    ch for ch in str(key).lower() if ch.isalnum()
+                )
+                if (
+                    "ivpercentile" in normalized
+                    or "impliedvolatilitypercentile" in normalized
+                    or "ivrank" in normalized
+                    or "impliedvolatilityrank" in normalized
+                ):
+                    found[child_path] = child
+                found.update(find_iv_fields(child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value[:25]):
+                child_path = f"{path}[{index}]"
+                found.update(find_iv_fields(child, child_path))
+        return found
+
+    discovered = find_iv_fields(body)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "project": "NVDA_COVERED_CALL",
+        "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+        "provider": "Eulerpool",
+        "symbol": symbol,
+        "api_key_configured": True,
+        "status_code": response.status_code,
+        "iv_percentile_or_rank_fields_found": bool(discovered),
+        "discovered_iv_fields": discovered,
+        "provider_payload": body,
+        "next_interpretation": (
+            "Connection succeeded. Validate the exact IV Percentile field, value, "
+            "scale, and meaning against the TradeStation OptionStation display "
+            "before connecting it to the covered-call approval gate."
+        ),
+        "safety": (
+            "READ ONLY diagnostic. Existing NVDA covered-call approval, QQQ, "
+            "SOXL, and all order functions are unchanged."
+        )
+    }), 200
+
+
 if __name__ == "__main__":
     port = int(
         os.environ.get(
