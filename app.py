@@ -6513,14 +6513,17 @@ def odts_vertical_test():
     QQQ Vertical V1 read-only selector.
 
     Frozen V1 rules:
-      - BULLISH -> Bull Call Debit Spread
-      - BEARISH -> Bear Put Debit Spread
+      - BULLISH only -> Bull Call Debit Spread
+      - Bearish/neutral conditions remain WAIT; no Bear Put selection
       - Weekly expiration, exactly 1 or 2 calendar DTE
-      - Long-leg absolute Delta 0.50 to 0.65
+      - Long-leg Delta 0.55 to 0.65
+      - Short-leg Delta 0.30 to 0.40
+      - Net Delta +0.15 to +0.35
       - Short leg exactly $2 away, same expiration
-      - Both legs require valid Bid/Ask and <=15% individual spread
-      - Net debit > $0 and <= $1.00
-      - Minimum reward:risk >= 1.00:1
+      - Each leg requires OI >=500 and Bid/Ask width <=$0.10 and <=10%
+      - Net Theta burden <=10% of net debit
+      - Net debit >$0 and <=$0.85; maximum loss <=$85
+      - Maximum profit >=$115; reward:risk >=1.35:1
       - One spread, SIM design only
       - Entry window 10:00 AM to 3:00 PM ET
       - Profit exit at +50% of maximum possible profit
@@ -6557,12 +6560,21 @@ def odts_vertical_test():
     underlying = "QQQ"
     allowed_dte = {1, 2}
     spread_width = 2.0
-    long_delta_min = 0.50
+    long_delta_min = 0.55
     long_delta_max = 0.65
     long_delta_mid = (long_delta_min + long_delta_max) / 2.0
-    max_leg_spread_pct = 15.0
-    max_net_debit = 1.00
-    min_reward_risk = 1.00
+    short_delta_min = 0.30
+    short_delta_max = 0.40
+    net_delta_min = 0.15
+    net_delta_max = 0.35
+    max_leg_spread_dollars = 0.10
+    max_leg_spread_pct = 10.0
+    min_open_interest = 500
+    max_theta_burden_pct = 10.0
+    max_net_debit = 0.85
+    max_loss_dollars_allowed = 85.0
+    min_max_profit_dollars = 115.0
+    min_reward_risk = 1.35
     quantity_spreads = 1
     strike_proximity = 18
 
@@ -6582,8 +6594,8 @@ def odts_vertical_test():
         option_type_needed = "CALL"
     elif zlema_state < 0:
         direction = "BEARISH"
-        vertical_type = "BEAR PUT"
-        option_type_needed = "PUT"
+        vertical_type = ""
+        option_type_needed = ""
     else:
         direction = "NEUTRAL"
         vertical_type = ""
@@ -6597,15 +6609,6 @@ def odts_vertical_test():
         and ema21 is not None
         and qqq_close > vwap
         and qqq_close > ema21
-    ):
-        trend_alignment_gate = "YES"
-    elif (
-        direction == "BEARISH"
-        and qqq_close is not None
-        and vwap is not None
-        and ema21 is not None
-        and qqq_close < vwap
-        and qqq_close < ema21
     ):
         trend_alignment_gate = "YES"
 
@@ -6625,14 +6628,14 @@ def odts_vertical_test():
     entry_window_gate = "YES" if entry_window_open else "WAIT"
 
     market_gate_ready = (
-        direction in {"BULLISH", "BEARISH"}
+        direction == "BULLISH"
         and trend_alignment_gate == "YES"
         and zlema_confirmation_gate == "YES"
         and adx_gate in {"YES", "CAUTION"}
     )
 
     # No need to stream an option chain when the market direction is neutral.
-    if direction == "NEUTRAL":
+    if direction != "BULLISH":
         return jsonify({
             "ok": True,
             "read_only": True,
@@ -6651,14 +6654,27 @@ def odts_vertical_test():
                 "adx": adx_gate,
                 "entry_window": entry_window_gate,
                 "vertical_contract": "WAIT",
+                "delta": "WAIT",
+                "liquidity": "WAIT",
+                "theta_burden": "WAIT",
+                "net_debit": "WAIT",
+                "max_loss": "WAIT",
+                "max_profit": "WAIT",
                 "reward_risk": "WAIT",
             },
             "rules": {
                 "spread_width": spread_width,
                 "allowed_dte": sorted(allowed_dte),
                 "long_abs_delta": [long_delta_min, long_delta_max],
+                "short_abs_delta": [short_delta_min, short_delta_max],
+                "net_delta": [net_delta_min, net_delta_max],
+                "max_leg_spread_dollars": max_leg_spread_dollars,
                 "max_leg_spread_pct": max_leg_spread_pct,
+                "min_open_interest_each_leg": min_open_interest,
+                "max_theta_burden_pct": max_theta_burden_pct,
                 "max_net_debit": max_net_debit,
+                "max_loss_dollars": max_loss_dollars_allowed,
+                "min_max_profit_dollars": min_max_profit_dollars,
                 "min_reward_risk": min_reward_risk,
                 "quantity_spreads": quantity_spreads,
                 "entry_window_et": "10:00-15:00",
@@ -6754,8 +6770,10 @@ def odts_vertical_test():
             "ask": round(ask, 4),
             "mid": round(mid, 4),
             "spread_pct": round(leg_spread_pct, 4),
+            "spread_dollars": round(leg_spread, 4),
             "delta": round(delta_raw, 6) if delta_raw is not None else "",
             "abs_delta": round(abs(delta_raw), 6) if delta_raw is not None else "",
+            "theta": round(safe_float(item.get("Theta")), 6) if safe_float(item.get("Theta")) is not None else "",
             "volume": safe_int(item.get("Volume"), 0),
             "open_interest": safe_int(item.get("DailyOpenInterest"), 0),
         }
@@ -6934,7 +6952,9 @@ def odts_vertical_test():
             if (
                 long_abs_delta is None
                 or not (long_delta_min <= long_abs_delta <= long_delta_max)
+                or safe_float(long_leg.get("spread_dollars"), 999.0) > max_leg_spread_dollars
                 or safe_float(long_leg.get("spread_pct"), 999.0) > max_leg_spread_pct
+                or safe_int(long_leg.get("open_interest"), 0) < min_open_interest
             ):
                 continue
 
@@ -6946,7 +6966,18 @@ def odts_vertical_test():
             short_leg = legs_by_strike.get(round(short_strike, 4))
             if short_leg is None:
                 continue
-            if safe_float(short_leg.get("spread_pct"), 999.0) > max_leg_spread_pct:
+            short_abs_delta = safe_float(short_leg.get("abs_delta"))
+            if (
+                short_abs_delta is None
+                or not (short_delta_min <= short_abs_delta <= short_delta_max)
+                or safe_float(short_leg.get("spread_dollars"), 999.0) > max_leg_spread_dollars
+                or safe_float(short_leg.get("spread_pct"), 999.0) > max_leg_spread_pct
+                or safe_int(short_leg.get("open_interest"), 0) < min_open_interest
+            ):
+                continue
+
+            net_delta = long_abs_delta - short_abs_delta
+            if not (net_delta_min <= net_delta <= net_delta_max):
                 continue
 
             # Conservative executable debit: buy long at Ask, sell short at Bid.
@@ -6957,12 +6988,26 @@ def odts_vertical_test():
             max_loss_dollars = net_debit * 100.0 * quantity_spreads
             max_profit_per_share = spread_width - net_debit
             max_profit_dollars = max_profit_per_share * 100.0 * quantity_spreads
+            if (
+                max_loss_dollars > max_loss_dollars_allowed
+                or max_profit_dollars < min_max_profit_dollars
+            ):
+                continue
             reward_risk = (
                 max_profit_dollars / max_loss_dollars
                 if max_loss_dollars > 0
                 else None
             )
             if reward_risk is None or reward_risk < min_reward_risk:
+                continue
+
+            long_theta = safe_float(long_leg.get("theta"))
+            short_theta = safe_float(short_leg.get("theta"))
+            if long_theta is None or short_theta is None:
+                continue
+            net_theta = long_theta - short_theta
+            theta_burden_pct = abs(net_theta) / net_debit * 100.0
+            if theta_burden_pct > max_theta_burden_pct:
                 continue
 
             profit_exit_spread_price = net_debit + 0.50 * max_profit_per_share
@@ -6985,6 +7030,16 @@ def odts_vertical_test():
                 "max_loss_dollars": round(max_loss_dollars, 2),
                 "max_profit_dollars": round(max_profit_dollars, 2),
                 "reward_risk": round(reward_risk, 4),
+                "net_delta": round(net_delta, 6),
+                "net_theta": round(net_theta, 6),
+                "theta_burden_pct": round(theta_burden_pct, 4),
+                "theta_gate": "YES",
+                "delta_gate": "YES",
+                "liquidity_gate": "YES",
+                "debit_gate": "YES",
+                "max_loss_gate": "YES",
+                "max_profit_gate": "YES",
+                "reward_risk_gate": "YES",
                 "breakeven": round(breakeven, 4),
                 "profit_exit_rule": "+50% OF MAXIMUM POSSIBLE PROFIT",
                 "profit_exit_spread_price": round(profit_exit_spread_price, 4),
@@ -6995,13 +7050,13 @@ def odts_vertical_test():
                 "delta_distance": round(abs(long_abs_delta - long_delta_mid), 8),
             })
 
-    # Step 5 frozen rule: compare 1-DTE and 2-DTE qualified spreads and
-    # choose the better reward:risk. Delta closeness is only a tie-breaker.
+    # Compare 1-DTE and 2-DTE qualified spreads. Reward:risk remains primary;
+    # 2-DTE is preferred when reward:risk is tied, then Delta closeness.
     vertical_candidates.sort(
         key=lambda item: (
             -float(item["reward_risk"]),
+            0 if int(item["dte"]) == 2 else 1,
             float(item["delta_distance"]),
-            int(item["dte"]),
         )
     )
     selected_vertical = vertical_candidates[0] if vertical_candidates else None
@@ -7056,17 +7111,30 @@ def odts_vertical_test():
             "adx": adx_gate,
             "entry_window": entry_window_gate,
             "vertical_contract": vertical_contract_gate,
+            "delta": "YES" if selected_vertical else "WAIT",
+            "liquidity": "YES" if selected_vertical else "WAIT",
+            "theta_burden": "YES" if selected_vertical else "WAIT",
+            "net_debit": "YES" if selected_vertical else "WAIT",
+            "max_loss": "YES" if selected_vertical else "WAIT",
+            "max_profit": "YES" if selected_vertical else "WAIT",
             "reward_risk": reward_risk_gate,
         },
         "rules": {
             "expiration_type": "Weekly",
             "allowed_dte": sorted(allowed_dte),
             "long_abs_delta": [long_delta_min, long_delta_max],
+            "short_abs_delta": [short_delta_min, short_delta_max],
+            "net_delta": [net_delta_min, net_delta_max],
             "short_leg_rule": "$2 away from long strike, same expiration",
             "spread_width": spread_width,
+            "max_leg_spread_dollars": max_leg_spread_dollars,
             "max_leg_spread_pct": max_leg_spread_pct,
-            "net_debit_rule": ">$0 and <=$1.00",
+            "min_open_interest_each_leg": min_open_interest,
+            "max_theta_burden_pct": max_theta_burden_pct,
+            "net_debit_rule": ">$0 and <=$0.85",
             "max_net_debit": max_net_debit,
+            "max_loss_dollars": max_loss_dollars_allowed,
+            "min_max_profit_dollars": min_max_profit_dollars,
             "min_reward_risk": min_reward_risk,
             "quantity_spreads": quantity_spreads,
             "entry_window_et": "10:00-15:00",
