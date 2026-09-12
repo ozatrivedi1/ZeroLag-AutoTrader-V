@@ -179,6 +179,7 @@ TS_HEADERS = [
 
 journal_lock = threading.Lock()
 
+
 # Serializes LIVE position-check + order submission so two webhooks
 # cannot pass the position gate at the same time.
 live_order_lock = threading.Lock()
@@ -358,6 +359,7 @@ def journal_tv_signal(
     }
 
     append_csv(
+
         TV_CSV_PATH,
         TV_HEADERS,
         row
@@ -538,6 +540,7 @@ def journal_ts_execution_background(
         qty = (
             position_qty
             if pos_ok
+
             else ""
         )
 
@@ -717,6 +720,7 @@ def missing_config():
     ]:
         if not value:
             missing.append(name)
+
 
     return missing
 
@@ -898,6 +902,7 @@ def get_valid_access_token():
     if token_store.get(
         "refresh_token"
     ):
+
         ok, message = (
             refresh_access_token()
         )
@@ -1079,6 +1084,7 @@ def odts_nvda_covered_call_test():
             if not line:
                 continue
 
+
             text = line.decode("utf-8").strip()
 
             try:
@@ -1259,6 +1265,7 @@ def odts_nvda_covered_call_option_test():
                 if isinstance(strikes, list) and strikes:
                     strike = number(strikes[0])
 
+
             if (
                 option_type == "CALL"
                 and strike is not None
@@ -1437,6 +1444,7 @@ def _odts_adx(highs, lows, closes, length=14):
     minus_dm_smoothed = _odts_wilder(minus_dm_values, length)
 
     dx_values = []
+
 
     for i in range(len(tr_values)):
         if (
@@ -1618,6 +1626,7 @@ def odts_qqq_indicators_test():
     if len(closes) < 25:
         return jsonify({
             "ok": False,
+
             "read_only": True,
             "order_sent": False,
             "symbol": symbol,
@@ -1800,6 +1809,7 @@ def odts_qqq_indicators_test():
     })
 
 
+
 # ==============================================================
 # ODTS QQQ OPTION CONTRACT SELECTOR V1
 # READ ONLY / NO ORDER SUBMISSION
@@ -1977,6 +1987,7 @@ def odts_option_test(direction_override=None):
             or ask < bid
         ):
             return None
+
 
         if mid is None or mid <= 0:
             mid = (bid + ask) / 2.0
@@ -2158,6 +2169,7 @@ def odts_option_test(direction_override=None):
             )
         }), 502
 
+
     expirations = (
         expiration_body.get("Expirations", [])
         if isinstance(expiration_body, dict)
@@ -2338,6 +2350,7 @@ def odts_option_test(direction_override=None):
                 "ok": True,
                 "message_count": message_count,
                 "candidate_count": candidate_count,
+
             })
 
     calls = [
@@ -2518,6 +2531,7 @@ def odts_control_status():
         direction = "BULLISH"
         option_side = "CALL"
     elif zlema_state < 0:
+
         direction = "BEARISH"
         option_side = "PUT"
     else:
@@ -2698,6 +2712,7 @@ def _odts_email_state_update(**kwargs):
 
 def _odts_email_state_snapshot():
     with odts_email_lock:
+
         return dict(odts_email_state)
 
 
@@ -2879,6 +2894,7 @@ def _odts_email_alert_worker():
             ready = _odts_setup_is_approval_ready(snapshot)
             state = _odts_email_state_snapshot()
 
+
             if not ready:
                 _odts_email_state_update(
                     armed=True,
@@ -3058,6 +3074,7 @@ def odts_approval_email_test():
             "APPROVAL_TEST_EMAIL_SENT"
             if sent else "APPROVAL_TEST_EMAIL_FAILED"
         ),
+
         last_email_sent_at=(
             now_iso if sent
             else _odts_email_state_snapshot().get("last_email_sent_at")
@@ -3238,6 +3255,7 @@ def submit_odts_sim_option_limit_order(
 
     try:
         response = requests.post(
+
             url,
             headers=ts_headers(access_token),
             json=order,
@@ -3418,6 +3436,7 @@ def odts_approval_decision():
             return jsonify({
                 "ok": False,
                 "order_sent": False,
+
                 "error": "Blocked: outside 09:30-16:00 ET regular session.",
             }), 403
 
@@ -3598,6 +3617,7 @@ def odts_approval_decision():
 
 
 # ==============================================================
+
 # ODTS QQQ FILL CAPTURE / POSITION MONITOR - READ ONLY V1
 # ==============================================================
 
@@ -3778,6 +3798,7 @@ def submit_odts_sim_option_exit_order(access_token, option_symbol, quantity=1):
     if not odts_sim_environment_ok():
         return False, {"error": "Blocked: ODTS option exits require the TradeStation SIM API base URL."}
     if ODTS_SIM_EXIT_ENABLED != "YES":
+
         return False, {"error": "Blocked: ODTS_SIM_EXIT_ENABLED is not YES."}
     if not TS_SIM_ACCOUNT_ID:
         return False, {"error": "Blocked: TS_SIM_ACCOUNT_ID is missing."}
@@ -3958,6 +3979,7 @@ def odts_exit_trigger_sim_test():
         "max_loss_pct": 35.0,
         "profit_target_pct": 50.0,
         "decision": decision,
+
         "reason": reason,
         "simulated_unrealized_pct": pnl_pct,
         "simulated_unrealized_dollars": pnl_dollars,
@@ -4139,6 +4161,7 @@ def _odts_monitor_update(**kwargs):
         odts_monitor_state.update(kwargs)
 
 
+
 def _odts_recover_single_qqq_option_position(access_token):
     """
     Recover an ODTS candidate after a Render restart.
@@ -4318,6 +4341,7 @@ def _odts_continuous_monitor_worker():
                 continue
 
             access_token, token_error = get_valid_access_token()
+
             if not access_token:
                 _odts_monitor_update(
                     symbol=symbol,
@@ -4499,6 +4523,7 @@ def odts_recovery_test():
             )
         }), 409
 
+
     if not recovered:
         return jsonify({
             "ok": True,
@@ -4678,6 +4703,7 @@ def get_soxl_position(
                 TypeError,
                 ValueError
             ):
+
                 quantity = 0.0
 
             return (
@@ -4857,6 +4883,7 @@ def get_soxl_live_position(access_token):
                 quantity = float(raw_qty)
             except (TypeError, ValueError):
                 quantity = 0.0
+
 
             return (True, quantity, body)
 
@@ -5038,6 +5065,7 @@ def duplicate_signal(
 @app.get("/")
 def home():
     return jsonify({
+
         "service":
             "ZeroLag AutoTrader",
 
@@ -5218,6 +5246,7 @@ def auth_status():
 
         "refresh_token_present":
             bool(
+
                 token_store.get(
                     "refresh_token"
                 )
@@ -5399,6 +5428,7 @@ def auth_callback():
         "code":
             code,
 
+
         "redirect_uri":
             TS_REDIRECT_URI,
     }
@@ -5579,6 +5609,7 @@ def account_test():
 def live_account_test():
     access_token, error = get_valid_access_token()
 
+
     if not access_token:
         return jsonify({
             "ok": False,
@@ -5758,6 +5789,7 @@ def position_test():
                 False,
 
             "error":
+
                 error,
 
             "next_step":
@@ -5938,6 +5970,7 @@ def webhook(token):
             "strategy=%s action=%s "
             "symbol=%s | allowed=%s",
             strategy_name,
+
             action,
             symbol,
             sorted(
@@ -6118,6 +6151,7 @@ def webhook(token):
             if action == "SELL" and position_qty <= 0:
                 return jsonify({
                     "ok": True, "received": True, "order_sent": False,
+
                     "environment": "LIVE", "strategy": strategy_name,
                     "message": "LIVE SELL blocked: account is already flat.",
                     "position_quantity": position_qty
@@ -6298,6 +6332,7 @@ def webhook(token):
                 False,
 
             "handoff":
+
                 True,
 
             "strategy":
@@ -6477,6 +6512,7 @@ def webhook_status():
 
         "last_webhook_received":
             last_webhook["received"],
+
 
         "received_at":
             last_webhook["received_at"],
@@ -6658,6 +6694,7 @@ def odts_vertical_test():
                 "liquidity": "WAIT",
                 "theta_burden": "WAIT",
                 "net_debit": "WAIT",
+
                 "max_loss": "WAIT",
                 "max_profit": "WAIT",
                 "reward_risk": "WAIT",
@@ -6839,6 +6876,7 @@ def odts_vertical_test():
                 "type": expiration_type,
             })
 
+
     eligible_expirations.sort(key=lambda item: (item["dte"], item["date"]))
 
     if not eligible_expirations:
@@ -7018,6 +7056,7 @@ def odts_vertical_test():
                 else long_strike - net_debit
             )
 
+
             vertical_candidates.append({
                 "vertical_type": vertical_type,
                 "expiration": expiration_date.isoformat(),
@@ -7162,14 +7201,14 @@ def odts_vertical_test():
 
 
 # ==============================================================
-# #11F NVDA COVERED CALL V1 - FLAT SELECTED-CALL FEED / TIMEOUT SAFE
+# #12 NVDA COVERED CALL V1 - FLAT SELECTED-CALL FEED / TIMEOUT SAFE
 # READ ONLY / NO ORDER SUBMISSION
 # ==============================================================
 
 @app.get("/odts-nvda-covered-call-approval")
 def odts_nvda_covered_call_approval():
     """
-    NVDA Covered Call V1 read-only approval document (#11F flat-feed, timeout-safe).
+    NVDA Covered Call V1 read-only approval document (#12 flat-feed, timeout-safe).
 
     Frozen V1 rules:
       - Underlying NVDA; 100 shares covered; 1 call contract
@@ -7197,6 +7236,7 @@ def odts_nvda_covered_call_approval():
       &event_before_expiration=NO
       &cost_basis=210
       &min_assignment_price=210
+
 
     This route NEVER submits, modifies, cancels, or closes an order.
     """
@@ -7228,7 +7268,13 @@ def odts_nvda_covered_call_approval():
     max_spread_pct = 15.0
     premium_yes_pct = 1.00
     premium_caution_pct = 0.60
-    strike_proximity = 40
+    # Restrict the TradeStation stream to the useful neighborhood around
+    # NVDA. The prior value of 40 produced an unnecessarily large stream and
+    # could exhaust the total scan deadline before every expiration finished.
+    # This changes scan efficiency only; every returned contract must still
+    # pass the same frozen DTE, Delta, premium, assignment and liquidity rules.
+    strike_proximity = 16
+    preferred_dte = 14
 
     def safe_float(value, default=None):
         try:
@@ -7372,6 +7418,7 @@ def odts_nvda_covered_call_approval():
                 "order_sent": False,
                 "approval_enabled": False,
                 "project": "NVDA_COVERED_CALL_V1",
+
                 "error": "ivx_percentile must be between 0 and 100",
             }), 400
         if ivx_percentile < 25:
@@ -7465,7 +7512,16 @@ def odts_nvda_covered_call_approval():
                     "type": expiration_type,
                 })
 
-    eligible_expirations.sort(key=lambda item: (item["dte"], item["date"]))
+    # Inspect the expirations closest to the middle of the frozen 7-21 DTE
+    # window first. A partial scan remains approval-ineligible, but this makes
+    # the first read-only candidate more representative if TS responds slowly.
+    eligible_expirations.sort(
+        key=lambda item: (
+            abs(item["dte"] - preferred_dte),
+            item["dte"],
+            item["date"],
+        )
+    )
 
     if not eligible_expirations:
         return jsonify({
@@ -7495,7 +7551,7 @@ def odts_nvda_covered_call_approval():
     # HTTP request open indefinitely. A partial scan can DISPLAY candidates,
     # but it can never return approval eligibility.
     scan_started = time.monotonic()
-    scan_deadline_seconds = 15.0
+    scan_deadline_seconds = 20.0
     max_messages_per_expiry = 80
     scan_truncated = False
     truncation_reason = ""
@@ -7543,6 +7599,7 @@ def odts_nvda_covered_call_approval():
                     break
                 if not line:
                     continue
+
                 raw = line.decode("utf-8", errors="replace").strip()
                 if not raw:
                     continue
@@ -7723,6 +7780,7 @@ def odts_nvda_covered_call_approval():
                 "dte": expiry["dte"],
                 "ok": True,
                 "message_count": message_count,
+
                 "candidate_count": candidate_count_for_expiry,
             })
 
@@ -7791,12 +7849,14 @@ def odts_nvda_covered_call_approval():
         "scan_limits": {
             "total_deadline_seconds": scan_deadline_seconds,
             "max_messages_per_expiry": max_messages_per_expiry,
+            "strike_proximity": strike_proximity,
+            "preferred_dte": preferred_dte,
             "chain_connect_timeout_seconds": 3,
             "chain_read_timeout_seconds": 3,
         },
         "selected_call": selected_call,
 
-        # #11F Excel-friendly flattened selected-call fields.
+        # #12 Excel-friendly flattened selected-call fields.
         # These duplicate the same READ-ONLY selected_call values above so
         # Excel/Power Query can consume them directly without expanding a
         # nested JSON Record. No order capability is added by these fields.
@@ -7901,6 +7961,7 @@ def odts_nvda_covered_call_approval():
                 "preferred": "<=10% Bid/Ask spread",
                 "caution": ">10% to <=15%",
                 "wait": ">15% or invalid quote",
+
             },
             "volume_open_interest": "DISPLAY ONLY - NO HARD V1 MINIMUM",
             "human_control": "APPROVE / PASS only after a future execution phase",
@@ -7914,7 +7975,7 @@ def odts_nvda_covered_call_approval():
             for item in eligible_expirations
         ],
         "stream_notes": stream_notes,
-        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #11F",
+        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #12",
         "input_note": (
             "Until a validated automatic IVX-percentile and event-calendar feed is "
             "connected, supply ivx_percentile and event_before_expiration in the URL."
@@ -7924,7 +7985,7 @@ def odts_nvda_covered_call_approval():
             "&event_before_expiration=NO&cost_basis=210&min_assignment_price=210"
         ),
         "next_step": (
-            "Validate #11F flat selected-call output against the live NVDA option chain. "
+            "Validate #12 flat selected-call output against the live NVDA option chain. "
             "Do not add covered-call execution until the approval document is verified."
         ),
     }), 200
@@ -8081,6 +8142,7 @@ if __name__ == "__main__":
 # ==============================================================
 @app.get("/odts-nvda-iv-percentile-test")
 def odts_nvda_iv_percentile_test():
+
     """Inspect live TradeStation v3 payloads for a native IV percentile/rank field."""
     access_token, error = get_valid_access_token()
     if not access_token:
