@@ -8391,6 +8391,100 @@ def universal_options_sim_preview():
     return jsonify(result), 200 if response.ok else 502
 
 
+@app.get("/universal-options-sim-preview-link")
+def universal_options_sim_preview_link():
+    """Excel-friendly GET wrapper for SIM confirmation only; never submits."""
+    leg_count_text = str(request.args.get("leg_count") or "").strip()
+    try:
+        leg_count = int(leg_count_text)
+    except ValueError:
+        leg_count = 0
+
+    legs = []
+    for index in range(1, leg_count + 1):
+        legs.append({
+            "symbol": request.args.get(f"leg{index}_symbol"),
+            "expiration": request.args.get(f"leg{index}_expiration"),
+            "ratio": request.args.get(f"leg{index}_ratio", "1"),
+            "trade_action": request.args.get(f"leg{index}_action"),
+        })
+
+    payload = {
+        "strategy_name": request.args.get("strategy_name"),
+        "underlying": request.args.get("underlying"),
+        "contracts": request.args.get("contracts", "1"),
+        "price_effect": request.args.get("price_effect"),
+        "net_price": request.args.get("net_price"),
+        "max_loss_dollars": request.args.get("max_loss_dollars"),
+        "max_capital_dollars": request.args.get("max_capital_dollars"),
+        "legs": legs,
+    }
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    try:
+        confirmation = _build_universal_sim_confirmation(payload)
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": str(exc),
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    try:
+        response = requests.post(
+            f"{UNIVERSAL_OPTIONS_SIM_API_BASE_URL}/orderexecution/orderconfirm",
+            headers=ts_headers(access_token),
+            json=confirmation["order"],
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    return jsonify({
+        "ok": response.ok,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_EXCEL_LINK_PREVIEW_ONLY",
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "trade_station_status_code": response.status_code,
+        "validated_input": {
+            key: value for key, value in confirmation.items() if key != "order"
+        },
+        "trade_station_confirmation": ts_body,
+        "safety": "CONFIRMATION ONLY. No order can be submitted by this link.",
+    }), 200 if response.ok else 502
+
+
 if __name__ == "__main__":
     port = int(
         os.environ.get(
