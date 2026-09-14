@@ -8122,6 +8122,275 @@ def odts_nvda_eulerpool_iv_percentile_test():
     }), 200
 
 
+# ==============================================================
+# UNIVERSAL OPTIONS SIM LAB V1 - PHASE 2
+# SIM ORDER CONFIRMATION ONLY / NEVER SUBMITS AN ORDER
+# ==============================================================
+
+UNIVERSAL_OPTIONS_SIM_API_BASE_URL = "https://sim-api.tradestation.com/v3"
+UNIVERSAL_OPTIONS_ALLOWED_ACTIONS = {
+    "BUYTOOPEN",
+    "SELLTOOPEN",
+    "BUYTOCLOSE",
+    "SELLTOCLOSE",
+}
+UNIVERSAL_OPTIONS_ALLOWED_PRICE_EFFECTS = {"DEBIT", "CREDIT"}
+
+
+def _universal_positive_number(value, field_name, allow_zero=False):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be numeric.")
+
+    minimum_ok = number >= 0 if allow_zero else number > 0
+    if not minimum_ok:
+        comparison = "zero or greater" if allow_zero else "greater than zero"
+        raise ValueError(f"{field_name} must be {comparison}.")
+    return number
+
+
+def _build_universal_sim_confirmation(payload):
+    """Validate an Excel/API request and build one SIM confirmation payload."""
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be one JSON object.")
+
+    strategy_name = str(payload.get("strategy_name") or "").strip().upper()
+    underlying = str(payload.get("underlying") or "").strip().upper()
+    price_effect = str(payload.get("price_effect") or "").strip().upper()
+    legs = payload.get("legs")
+
+    if not strategy_name:
+        raise ValueError("strategy_name is required.")
+    if not underlying or not underlying.replace(".", "").isalnum():
+        raise ValueError("underlying is required and must be a ticker symbol.")
+    if price_effect not in UNIVERSAL_OPTIONS_ALLOWED_PRICE_EFFECTS:
+        raise ValueError("price_effect must be DEBIT or CREDIT.")
+    if not isinstance(legs, list) or not 2 <= len(legs) <= 4:
+        raise ValueError("legs must contain exactly 2, 3, or 4 option legs.")
+
+    contracts_number = _universal_positive_number(
+        payload.get("contracts", 1), "contracts"
+    )
+    if not contracts_number.is_integer() or contracts_number > 10:
+        raise ValueError("contracts must be a whole number from 1 through 10.")
+    contracts = int(contracts_number)
+
+    net_price = round(
+        _universal_positive_number(payload.get("net_price"), "net_price"),
+        2,
+    )
+    max_loss_dollars = round(
+        _universal_positive_number(
+            payload.get("max_loss_dollars"), "max_loss_dollars"
+        ),
+        2,
+    )
+    max_capital_dollars = round(
+        _universal_positive_number(
+            payload.get("max_capital_dollars"), "max_capital_dollars"
+        ),
+        2,
+    )
+    if max_loss_dollars > max_capital_dollars:
+        raise ValueError(
+            "Blocked: max_loss_dollars exceeds max_capital_dollars."
+        )
+
+    expirations = set()
+    order_legs = []
+    normalized_legs = []
+    for index, leg in enumerate(legs, start=1):
+        if not isinstance(leg, dict):
+            raise ValueError(f"leg {index} must be a JSON object.")
+
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        expiration = str(leg.get("expiration") or "").strip()
+        trade_action = str(leg.get("trade_action") or "").strip().upper()
+        ratio_number = _universal_positive_number(
+            leg.get("ratio", 1), f"leg {index} ratio"
+        )
+
+        if not symbol or not symbol.startswith(underlying):
+            raise ValueError(
+                f"leg {index} symbol must be copied from TradeStation and "
+                f"must begin with {underlying}."
+            )
+        if trade_action not in UNIVERSAL_OPTIONS_ALLOWED_ACTIONS:
+            raise ValueError(
+                f"leg {index} trade_action must be BUYTOOPEN, SELLTOOPEN, "
+                "BUYTOCLOSE, or SELLTOCLOSE."
+            )
+        if not ratio_number.is_integer() or ratio_number > 10:
+            raise ValueError(f"leg {index} ratio must be a whole number from 1 to 10.")
+        if not expiration:
+            raise ValueError(f"leg {index} expiration is required (YYYY-MM-DD).")
+        try:
+            datetime.strptime(expiration, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"leg {index} expiration must use YYYY-MM-DD.")
+
+        ratio = int(ratio_number)
+        quantity = ratio * contracts
+        expirations.add(expiration)
+        order_legs.append({
+            "Symbol": symbol,
+            "Quantity": str(quantity),
+            "TradeAction": trade_action,
+        })
+        normalized_legs.append({
+            "leg": index,
+            "symbol": symbol,
+            "expiration": expiration,
+            "ratio": ratio,
+            "quantity": quantity,
+            "trade_action": trade_action,
+        })
+
+    if len(expirations) != 1:
+        raise ValueError(
+            "Blocked: TradeStation native multi-leg confirmation requires all "
+            "legs to use the same expiration. Double Calendars remain available "
+            "for Excel analysis only until TradeStation confirms a safe native "
+            "mixed-expiration order format."
+        )
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "OrderType": "Limit",
+        "LimitPrice": f"{net_price:.2f}",
+        "TimeInForce": {"Duration": "DAY"},
+        "Route": "Intelligent",
+        "Legs": order_legs,
+    }
+    return {
+        "strategy_name": strategy_name,
+        "underlying": underlying,
+        "contracts": contracts,
+        "price_effect": price_effect,
+        "net_price": net_price,
+        "max_loss_dollars": max_loss_dollars,
+        "max_capital_dollars": max_capital_dollars,
+        "expiration": next(iter(expirations)),
+        "legs": normalized_legs,
+        "order": order,
+    }
+
+
+@app.get("/universal-options-sim-preview-status")
+def universal_options_sim_preview_status():
+    return jsonify({
+        "ok": True,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_PREVIEW_ONLY",
+        "authenticated": bool(token_store.get("access_token")),
+        "sim_account_configured": bool(TS_SIM_ACCOUNT_ID),
+        "api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "supported_now": [
+            "VERTICAL",
+            "BUTTERFLY",
+            "IRON_CONDOR",
+            "CUSTOM_2_TO_4_LEG_SAME_EXPIRATION",
+        ],
+        "analysis_only_now": ["CALENDAR", "DOUBLE_CALENDAR"],
+        "next_step": "POST validated JSON to /universal-options-sim-preview.",
+    }), 200
+
+
+@app.post("/universal-options-sim-preview")
+def universal_options_sim_preview():
+    """
+    Ask TradeStation SIM to confirm/estimate one same-expiration spread.
+    This route deliberately has no call to /orderexecution/orders.
+    """
+    if not request.is_json:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Content-Type must be application/json.",
+        }), 415
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    try:
+        confirmation = _build_universal_sim_confirmation(
+            request.get_json(silent=False)
+        )
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": str(exc),
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    confirm_url = (
+        f"{UNIVERSAL_OPTIONS_SIM_API_BASE_URL}/orderexecution/orderconfirm"
+    )
+    try:
+        response = requests.post(
+            confirm_url,
+            headers=ts_headers(access_token),
+            json=confirmation["order"],
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+            "validated_input": {
+                key: value for key, value in confirmation.items() if key != "order"
+            },
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    result = {
+        "ok": response.ok,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_PREVIEW_ONLY",
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "trade_station_status_code": response.status_code,
+        "validated_input": {
+            key: value for key, value in confirmation.items() if key != "order"
+        },
+        "trade_station_confirmation": ts_body,
+        "safety": (
+            "CONFIRMATION ONLY. This route cannot place, replace, cancel, "
+            "or close an order."
+        ),
+    }
+    return jsonify(result), 200 if response.ok else 502
+
+
 if __name__ == "__main__":
     port = int(
         os.environ.get(
