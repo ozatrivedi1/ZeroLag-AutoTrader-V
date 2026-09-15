@@ -6548,18 +6548,18 @@ def odts_vertical_test():
     """
     QQQ Vertical V1 read-only selector.
 
-    Frozen V1 rules:
+    Moderate Risk SIM test rules:
       - BULLISH only -> Bull Call Debit Spread
       - Bearish/neutral conditions remain WAIT; no Bear Put selection
       - Weekly expiration, exactly 1 or 2 calendar DTE
-      - Long-leg Delta 0.55 to 0.65
+      - Long-leg Delta 0.45 to 0.60
       - Short-leg Delta 0.30 to 0.40
-      - Net Delta +0.15 to +0.35
+      - Net Delta +0.05 to +0.30
       - Short leg exactly $2 away, same expiration
       - Each leg requires OI >=500 and Bid/Ask width <=$0.10 and <=10%
       - Net Theta burden <=10% of net debit
-      - Net debit >$0 and <=$0.85; maximum loss <=$85
-      - Maximum profit >=$115; reward:risk >=1.35:1
+      - Net debit >$0 and <=$1.10; maximum loss <=$110
+      - Maximum profit >=$90; reward:risk >=0.80:1
       - One spread, SIM design only
       - Entry window 10:00 AM to 3:00 PM ET
       - Profit exit at +50% of maximum possible profit
@@ -6591,26 +6591,26 @@ def odts_vertical_test():
         }), int(indicators.get("status_code", 502) or 502)
 
     # ----------------------------------------------------------
-    # FROZEN V1 RULES
+    # MODERATE RISK SIM TEST RULES
     # ----------------------------------------------------------
     underlying = "QQQ"
     allowed_dte = {1, 2}
     spread_width = 2.0
-    long_delta_min = 0.55
-    long_delta_max = 0.65
+    long_delta_min = 0.45
+    long_delta_max = 0.60
     long_delta_mid = (long_delta_min + long_delta_max) / 2.0
     short_delta_min = 0.30
     short_delta_max = 0.40
-    net_delta_min = 0.15
-    net_delta_max = 0.35
+    net_delta_min = 0.05
+    net_delta_max = 0.30
     max_leg_spread_dollars = 0.10
     max_leg_spread_pct = 10.0
     min_open_interest = 500
     max_theta_burden_pct = 10.0
-    max_net_debit = 0.85
-    max_loss_dollars_allowed = 85.0
-    min_max_profit_dollars = 115.0
-    min_reward_risk = 1.35
+    max_net_debit = 1.10
+    max_loss_dollars_allowed = 110.0
+    min_max_profit_dollars = 90.0
+    min_reward_risk = 0.80
     quantity_spreads = 1
     strike_proximity = 18
 
@@ -7170,7 +7170,7 @@ def odts_vertical_test():
             "max_leg_spread_pct": max_leg_spread_pct,
             "min_open_interest_each_leg": min_open_interest,
             "max_theta_burden_pct": max_theta_burden_pct,
-            "net_debit_rule": ">$0 and <=$0.85",
+            "net_debit_rule": ">$0 and <=$1.10",
             "max_net_debit": max_net_debit,
             "max_loss_dollars": max_loss_dollars_allowed,
             "min_max_profit_dollars": min_max_profit_dollars,
