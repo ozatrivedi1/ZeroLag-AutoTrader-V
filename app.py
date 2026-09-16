@@ -7990,6 +7990,362 @@ def odts_nvda_covered_call_approval():
         ),
     }), 200
 
+
+# ==============================================================
+# #13 NVDA COVERED CALL V1 - TRADESTATION SIM CONFIRMATION
+# HUMAN APPROVE / PASS / CONFIRMATION ONLY / NEVER SUBMITS
+# ==============================================================
+
+NVDA_COVERED_CALL_SIM_API_BASE_URL = "https://sim-api.tradestation.com/v3"
+
+
+def _nvda_covered_call_snapshot():
+    """Return the current #12 read-only approval document as a plain dict."""
+    response = odts_nvda_covered_call_approval()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "NVDA covered-call selector did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+def _nvda_sim_share_position(access_token):
+    """Read the exact NVDA share position from TradeStation SIM."""
+    if not TS_SIM_ACCOUNT_ID:
+        return False, 0.0, {"error": "TS_SIM_ACCOUNT_ID is missing."}
+
+    url = (
+        f"{NVDA_COVERED_CALL_SIM_API_BASE_URL}/brokerage/accounts/"
+        f"{TS_SIM_ACCOUNT_ID}/positions"
+    )
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params={"symbol": "NVDA"},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, 0.0, {
+            "error": f"NVDA SIM position request failed: {exc}"
+        }
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, 0.0, {
+            "status_code": response.status_code,
+            "response": body,
+        }
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        positions = []
+
+    for position in positions:
+        symbol = str(position.get("Symbol") or "").strip().upper()
+        if symbol != "NVDA":
+            continue
+
+        raw_qty = position.get("Quantity")
+        if raw_qty in (None, ""):
+            raw_qty = position.get("LongQuantity")
+        try:
+            quantity = float(raw_qty or 0)
+        except (TypeError, ValueError):
+            quantity = 0.0
+
+        long_short = str(position.get("LongShort") or "").strip().upper()
+        if long_short == "SHORT":
+            quantity = -abs(quantity)
+        return True, quantity, body
+
+    return True, 0.0, body
+
+
+@app.get("/odts-nvda-covered-call-sim-preview-status")
+def odts_nvda_covered_call_sim_preview_status():
+    return jsonify({
+        "ok": True,
+        "project": "NVDA_COVERED_CALL_V1",
+        "phase": "13_SIM_CONFIRMATION_ONLY",
+        "authenticated": bool(token_store.get("access_token")),
+        "sim_account_configured": bool(TS_SIM_ACCOUNT_ID),
+        "sim_api_base": NVDA_COVERED_CALL_SIM_API_BASE_URL,
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "allowed_decisions": ["APPROVE", "PASS"],
+        "required_position": "Long at least 100 NVDA shares in TradeStation SIM",
+        "next_step": (
+            "Use /odts-nvda-covered-call-sim-preview with decision=APPROVE "
+            "or decision=PASS and the current IVX/event inputs."
+        ),
+        "safety": (
+            "Confirmation only. This phase has no call to "
+            "/orderexecution/orders."
+        ),
+    }), 200
+
+
+@app.get("/odts-nvda-covered-call-sim-preview")
+def odts_nvda_covered_call_sim_preview():
+    """
+    Revalidate the current NVDA covered-call candidate and ask TradeStation SIM
+    for an order confirmation. This route never submits an order.
+    """
+    decision = str(request.args.get("decision") or "").strip().upper()
+    if decision not in {"APPROVE", "PASS"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "decision must be APPROVE or PASS",
+        }), 400
+
+    if decision == "PASS":
+        return jsonify({
+            "ok": True,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "decision": "PASS",
+            "read_only": True,
+            "order_sent": False,
+            "result": "PASSED - NO CONFIRMATION AND NO ORDER",
+            "safety": "No TradeStation order or confirmation function was called.",
+        }), 200
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    snapshot_ok, snapshot = _nvda_covered_call_snapshot()
+    if not snapshot_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Current NVDA covered-call revalidation failed.",
+            "detail": snapshot,
+        }), 409
+
+    if snapshot.get("environment") != "SIM":
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: current NVDA covered-call environment is not SIM.",
+        }), 403
+
+    if snapshot.get("scan_complete") is not True:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "decision": "APPROVE",
+            "result": "BLOCKED - OPTION CHAIN SCAN INCOMPLETE",
+        }), 409
+
+    if str(snapshot.get("decision") or "").strip().upper() != "YES":
+        return jsonify({
+            "ok": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "decision": "APPROVE",
+            "system_decision": snapshot.get("decision"),
+            "approval_status": snapshot.get("approval_status"),
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - SYSTEM DECISION IS NOT YES",
+            "gates": (snapshot.get("selected_call") or {}).get("gates"),
+        }), 409
+
+    selected = snapshot.get("selected_call")
+    if not isinstance(selected, dict):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: no selected NVDA call is available.",
+        }), 409
+
+    option_symbol = str(selected.get("symbol") or "").strip()
+    option_type = str(selected.get("option_type") or "").strip().upper()
+    action = str(selected.get("action") or "").strip().upper()
+    try:
+        contracts = int(snapshot.get("contracts") or 0)
+        shares_covered = int(snapshot.get("shares_covered") or 0)
+        bid = round(float(selected.get("bid")), 2)
+        spread_pct = float(selected.get("spread_pct"))
+        abs_delta = float(selected.get("abs_delta"))
+        dte = int(selected.get("dte"))
+        strike = float(selected.get("strike"))
+        stock_price = float(snapshot.get("stock_price"))
+        cost_basis = float(snapshot.get("cost_basis_per_share"))
+        minimum_assignment = float(
+            snapshot.get("minimum_acceptable_assignment_price")
+        )
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: selected NVDA call contains invalid values.",
+        }), 409
+
+    frozen_gate_errors = []
+    if not option_symbol.upper().startswith("NVDA"):
+        frozen_gate_errors.append("Option symbol is not NVDA.")
+    if option_type != "CALL":
+        frozen_gate_errors.append("Selected option is not a call.")
+    if action != "SELL TO OPEN":
+        frozen_gate_errors.append("Selected action is not SELL TO OPEN.")
+    if contracts != 1 or shares_covered != 100:
+        frozen_gate_errors.append("Position must be 100 shares covered by 1 call.")
+    if not 7 <= dte <= 21:
+        frozen_gate_errors.append("DTE moved outside 7-21.")
+    if not 0.20 <= abs_delta <= 0.30:
+        frozen_gate_errors.append("Delta moved outside 0.20-0.30.")
+    if bid <= 0:
+        frozen_gate_errors.append("Bid is not positive.")
+    if spread_pct > 15.0:
+        frozen_gate_errors.append("Bid/Ask spread exceeds 15%.")
+    if strike <= stock_price:
+        frozen_gate_errors.append("Strike is not OTM.")
+    if strike <= cost_basis or strike < minimum_assignment:
+        frozen_gate_errors.append("Strike does not satisfy assignment-price rules.")
+
+    if frozen_gate_errors:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - FROZEN GATE REVALIDATION FAILED",
+            "errors": frozen_gate_errors,
+        }), 409
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    position_ok, nvda_quantity, position_detail = _nvda_sim_share_position(
+        access_token
+    )
+    if not position_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TradeStation SIM NVDA position check failed.",
+            "detail": position_detail,
+        }), 502
+
+    if nvda_quantity < 100:
+        return jsonify({
+            "ok": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - INSUFFICIENT NVDA SHARES IN SIM",
+            "required_nvda_shares": 100,
+            "sim_nvda_shares": nvda_quantity,
+        }), 409
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Limit",
+        "LimitPrice": f"{bid:.2f}",
+        "TradeAction": "SELLTOOPEN",
+        "TimeInForce": {"Duration": "DAY"},
+        "Route": "Intelligent",
+    }
+
+    try:
+        response = requests.post(
+            f"{NVDA_COVERED_CALL_SIM_API_BASE_URL}/orderexecution/orderconfirm",
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    return jsonify({
+        "ok": response.ok,
+        "project": "NVDA_COVERED_CALL_V1",
+        "phase": "13_SIM_CONFIRMATION_ONLY",
+        "environment": "SIM",
+        "decision": "APPROVE",
+        "system_decision": snapshot.get("decision"),
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_nvda_shares": nvda_quantity,
+        "selected_call": selected,
+        "confirmed_order": order,
+        "trade_station_status_code": response.status_code,
+        "trade_station_confirmation": ts_body,
+        "result": (
+            "TRADESTATION SIM CONFIRMATION RECEIVED - NO ORDER"
+            if response.ok else
+            "TRADESTATION SIM CONFIRMATION FAILED - NO ORDER"
+        ),
+        "safety": (
+            "Confirmation only. This route never calls "
+            "/orderexecution/orders and cannot place, replace, cancel, or close "
+            "an order."
+        ),
+    }), 200 if response.ok else 502
+
 # ==============================================================
 # START SERVER
 # ==============================================================
