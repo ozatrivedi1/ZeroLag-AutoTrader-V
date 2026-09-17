@@ -2198,11 +2198,10 @@ def odts_option_test(direction_override=None):
             expiration_item.get("Type", "")
         ).strip()
 
-        # Match the OptionStation setup: Weeklys only, 1-2 DTE.
-        if (
-            dte in allowed_dte
-            and expiration_type.lower() == "weekly"
-        ):
+        # Accept every listed QQQ expiration at 1-2 calendar DTE.
+        # This includes regular Monthly and Weekly expirations.  The
+        # frozen allowed_dte list continues to exclude 0 DTE.
+        if dte in allowed_dte:
             eligible_expirations.append({
                 "date": expiration_date,
                 "dte": dte,
@@ -2223,9 +2222,9 @@ def odts_option_test(direction_override=None):
             "order_sent": False,
             "underlying": underlying,
             "allowed_dte": allowed_dte,
-            "expiration_type": "Weekly",
+            "expiration_type": "Monthly or Weekly",
             "error": (
-                "No QQQ Weekly expiration was found at exactly "
+                "No QQQ Monthly or Weekly expiration was found at exactly "
                 "1 or 2 calendar DTE."
             )
         }), 404
@@ -2398,7 +2397,7 @@ def odts_option_test(direction_override=None):
         "direction": direction,
         "selection_status": selection_status,
         "rules": {
-            "expiration_type": "Weekly",
+            "expiration_type": "Monthly or Weekly",
             "allowed_dte": allowed_dte,
             "target_abs_delta": [
                 target_delta_min,
