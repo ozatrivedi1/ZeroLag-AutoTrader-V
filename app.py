@@ -6550,7 +6550,7 @@ def odts_vertical_test():
     Moderate Risk SIM test rules:
       - BULLISH only -> Bull Call Debit Spread
       - Bearish/neutral conditions remain WAIT; no Bear Put selection
-      - Weekly expiration, exactly 1 or 2 calendar DTE
+      - Monthly or Weekly expiration, exactly 1 or 2 calendar DTE
       - Long-leg Delta 0.45 to 0.60
       - Short-leg Delta 0.30 to 0.40
       - Net Delta +0.05 to +0.30
@@ -6815,7 +6815,7 @@ def odts_vertical_test():
         }
 
     # ----------------------------------------------------------
-    # 1) ELIGIBLE WEEKLY EXPIRATIONS AT EXACTLY 1 OR 2 DTE
+    # 1) ELIGIBLE MONTHLY OR WEEKLY EXPIRATIONS AT EXACTLY 1 OR 2 DTE
     # ----------------------------------------------------------
     expiration_url = f"{TS_API_BASE_URL}/marketdata/options/expirations/{underlying}"
     try:
@@ -6868,7 +6868,10 @@ def odts_vertical_test():
             continue
         dte = (expiration_date - today_et).days
         expiration_type = str(expiration_item.get("Type", "")).strip()
-        if dte in allowed_dte and expiration_type.lower() == "weekly":
+        # Accept every TradeStation-listed QQQ expiration at 1-2 DTE.
+        # This includes regular Monthly and Weekly expirations while the
+        # frozen allowed_dte set continues to exclude 0 DTE.
+        if dte in allowed_dte:
             eligible_expirations.append({
                 "date": expiration_date,
                 "dte": dte,
@@ -6892,7 +6895,7 @@ def odts_vertical_test():
             "decision": "WAIT",
             "approval_status": "WAIT",
             "selected_vertical": None,
-            "error": "No QQQ Weekly expiration was found at exactly 1 or 2 calendar DTE.",
+            "error": "No QQQ Monthly or Weekly expiration was found at exactly 1 or 2 calendar DTE.",
         }), 200
 
     # ----------------------------------------------------------
@@ -7158,7 +7161,7 @@ def odts_vertical_test():
             "reward_risk": reward_risk_gate,
         },
         "rules": {
-            "expiration_type": "Weekly",
+            "expiration_type": "Monthly or Weekly",
             "allowed_dte": sorted(allowed_dte),
             "long_abs_delta": [long_delta_min, long_delta_max],
             "short_abs_delta": [short_delta_min, short_delta_max],
