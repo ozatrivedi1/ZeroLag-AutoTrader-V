@@ -115,7 +115,6 @@ ALLOWED_STRATEGIES = {
 }
 
 MAX_TEST_QTY = 1
-LIVE_MAX_QTY = 1
 DUPLICATE_WINDOW_SECONDS = 20
 
 
@@ -750,8 +749,25 @@ def live_order_capability_ready():
         and TS_REDIRECT_URI
         and TS_LIVE_ACCOUNT_ID
         and WEBHOOK_TOKEN
-        and LIVE_MAX_QTY == 1
     )
+
+
+def parse_share_quantity(payload):
+    """Return a positive whole-share quantity supplied by TradingView."""
+    raw_value = payload.get("qty", payload.get("size"))
+
+    try:
+        numeric_value = float(raw_value)
+    except (TypeError, ValueError):
+        return (None, "qty must be a positive whole number")
+
+    if (
+        not numeric_value.is_integer()
+        or numeric_value <= 0
+    ):
+        return (None, "qty must be a positive whole number")
+
+    return (int(numeric_value), None)
 
 
 def live_market_session_now():
@@ -4889,11 +4905,11 @@ def get_soxl_live_position(access_token):
     return (True, 0.0, body)
 
 
-def build_live_market_order(action):
+def build_live_market_order(action, quantity=1):
     return {
         "AccountID": TS_LIVE_ACCOUNT_ID,
         "Symbol": ALLOWED_SYMBOL,
-        "Quantity": str(LIVE_MAX_QTY),
+        "Quantity": str(quantity),
         "OrderType": "Market",
         "TradeAction": action,
         "TimeInForce": {
@@ -4947,7 +4963,8 @@ def confirm_live_market_order(access_token, action="BUY"):
 def submit_live_market_order(
     access_token,
     action,
-    strategy_name
+    strategy_name,
+    quantity
 ):
     if action not in {"BUY", "SELL"}:
         return (False, {"error": "action must be BUY or SELL"})
@@ -4993,7 +5010,7 @@ def submit_live_market_order(
         )
 
     url = f"{TS_LIVE_API_BASE_URL}/orderexecution/orders"
-    order = build_live_market_order(action)
+    order = build_live_market_order(action, quantity)
 
     try:
         response = requests.post(
@@ -5761,7 +5778,7 @@ def live_confirm_buy_test():
         "ok": True,
         "environment": "LIVE",
         "symbol": ALLOWED_SYMBOL,
-        "quantity": LIVE_MAX_QTY,
+        "quantity": 1,
         "action": "BUY",
         "order_sent": False,
         "message": (
@@ -5921,6 +5938,20 @@ def webhook(token):
         )
         .strip()
     )
+
+    # Only Overnight may take its share quantity from TradingView.
+    # Regular remains deliberately fixed at one share.
+    quantity = 1
+    if strategy_name == "SOXL_OVERNIGHT":
+        quantity, quantity_error = parse_share_quantity(payload)
+
+        if quantity_error:
+            return jsonify({
+                "ok": False,
+                "received": True,
+                "order_sent": False,
+                "error": quantity_error,
+            }), 400
 
 
     # ----------------------------------------------------------
@@ -6125,39 +6156,29 @@ def webhook(token):
                     "details": pos_body
                 }), 502
 
-            # Only long-only combined holdings of 0, 1, or 2 are allowed.
-            if position_qty not in {0.0, 1.0, 2.0}:
+            # Long-only account protection. Overnight quantity is controlled
+            # by TradingView; Regular remains fixed at one share.
+            if position_qty < 0:
                 return jsonify({
                     "ok": False, "received": True, "order_sent": False,
                     "environment": "LIVE", "strategy": strategy_name,
-                    "error": "LIVE safety block: SOXL account position must be 0, 1, or 2 shares.",
+                    "error": "LIVE safety block: an existing short SOXL position was detected.",
                     "position_quantity": position_qty
                 }), 409
 
-            # A BUY from either strategy is independent. It is allowed
-            # whenever the combined account has fewer than 2 shares.
-            if action == "BUY" and position_qty >= 2:
-                return jsonify({
-                    "ok": True, "received": True, "order_sent": False,
-                    "environment": "LIVE", "strategy": strategy_name,
-                    "message": "LIVE BUY blocked: combined SOXL maximum of 2 shares already reached.",
-                    "position_quantity": position_qty
-                }), 200
-
-            # A SELL from either strategy closes exactly one share.
-            # TradingView strategy logic remains responsible for pairing
-            # that SELL with the same strategy's preceding BUY.
-            if action == "SELL" and position_qty <= 0:
+            # Never allow a SELL larger than the actual long position.
+            if action == "SELL" and quantity > position_qty:
                 return jsonify({
                     "ok": True, "received": True, "order_sent": False,
 
                     "environment": "LIVE", "strategy": strategy_name,
-                    "message": "LIVE SELL blocked: account is already flat.",
-                    "position_quantity": position_qty
+                    "message": "LIVE SELL blocked: requested quantity exceeds the current long position.",
+                    "requested_quantity": quantity,
+                    "position_quantity": position_qty,
                 }), 200
 
             order_ok, order_response = submit_live_market_order(
-                access_token, action, strategy_name
+                access_token, action, strategy_name, quantity
             )
 
             if not order_ok:
@@ -6175,7 +6196,7 @@ def webhook(token):
             log.warning(
                 "LIVE ORDER SENT | strategy=%s action=%s symbol=%s qty=%s "
                 "account_position_before=%s response=%s",
-                strategy_name, action, symbol, LIVE_MAX_QTY,
+                strategy_name, action, symbol, quantity,
                 position_qty, order_response
             )
 
@@ -6183,7 +6204,7 @@ def webhook(token):
                 "ok": True, "received": True, "dry_run": False,
                 "order_sent": True, "environment": "LIVE",
                 "strategy": strategy_name, "symbol": symbol,
-                "action": action, "quantity": LIVE_MAX_QTY,
+                "action": action, "quantity": quantity,
                 "account_position_before": position_qty,
                 "tradestation_response": order_response
             }), 200
