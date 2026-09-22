@@ -115,6 +115,7 @@ ALLOWED_STRATEGIES = {
 }
 
 MAX_TEST_QTY = 1
+MAX_LIVE_SHARE_QTY = 10
 DUPLICATE_WINDOW_SECONDS = 20
 
 
@@ -753,7 +754,7 @@ def live_order_capability_ready():
 
 
 def parse_share_quantity(payload):
-    """Return a positive whole-share quantity supplied by TradingView."""
+    """Return a safe whole-share quantity supplied by TradingView."""
     raw_value = payload.get("qty", payload.get("size"))
 
     try:
@@ -766,6 +767,13 @@ def parse_share_quantity(payload):
         or numeric_value <= 0
     ):
         return (None, "qty must be a positive whole number")
+
+    if numeric_value > MAX_LIVE_SHARE_QTY:
+        return (
+            None,
+            f"qty exceeds the maximum permitted live quantity of "
+            f"{MAX_LIVE_SHARE_QTY} shares"
+        )
 
     return (int(numeric_value), None)
 
@@ -5939,19 +5947,17 @@ def webhook(token):
         .strip()
     )
 
-    # Only Overnight may take its share quantity from TradingView.
-    # Regular remains deliberately fixed at one share.
-    quantity = 1
-    if strategy_name == "SOXL_OVERNIGHT":
-        quantity, quantity_error = parse_share_quantity(payload)
+    # Both authorized SOXL strategies take quantity from TradingView.
+    # parse_share_quantity enforces the 1-to-10 live safety range.
+    quantity, quantity_error = parse_share_quantity(payload)
 
-        if quantity_error:
-            return jsonify({
-                "ok": False,
-                "received": True,
-                "order_sent": False,
-                "error": quantity_error,
-            }), 400
+    if quantity_error:
+        return jsonify({
+            "ok": False,
+            "received": True,
+            "order_sent": False,
+            "error": quantity_error,
+        }), 400
 
 
     # ----------------------------------------------------------
@@ -6058,11 +6064,12 @@ def webhook(token):
 
     log.info(
         "WEBHOOK | strategy=%s "
-        "action=%s symbol=%s "
+        "action=%s symbol=%s qty=%s "
         "trading_enabled=%s",
         strategy_name,
         action,
         symbol,
+        quantity,
         TRADING_ENABLED
     )
 
@@ -6099,8 +6106,7 @@ def webhook(token):
     # SOXL LIVE ROUTE - REGULAR + OVERNIGHT INDEPENDENT
     #
     # Each TradingView strategy owns its own BUY/SELL sequence.
-    # Regular and Overnight may each hold one share simultaneously.
-    # Account-level maximum = 2 SOXL shares.
+    # Regular and Overnight may each submit 1 to 10 shares.
     # No BUY inheritance and no cross-strategy handoff.
     # ----------------------------------------------------------
 
@@ -6156,8 +6162,8 @@ def webhook(token):
                     "details": pos_body
                 }), 502
 
-            # Long-only account protection. Overnight quantity is controlled
-            # by TradingView; Regular remains fixed at one share.
+            # Long-only account protection. Both authorized strategies use
+            # the validated TradingView quantity.
             if position_qty < 0:
                 return jsonify({
                     "ok": False, "received": True, "order_sent": False,
