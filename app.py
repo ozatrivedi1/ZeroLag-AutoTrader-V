@@ -7,7 +7,7 @@ import json
 import threading
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
@@ -8868,6 +8868,535 @@ def universal_options_sim_preview_link():
         "trade_station_confirmation": ts_body,
         "safety": "CONFIRMATION ONLY. No order can be submitted by this link.",
     }), 200 if response.ok else 502
+
+
+# ==============================================================
+# QQQ STAGE 1 HISTORICAL DIRECTION STUDY
+# READ ONLY / UNDERLYING BARS ONLY / NO OPTION DATA / NO ORDERS
+# ==============================================================
+
+def _qqq_history_number(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _qqq_history_median(values):
+    clean = sorted(float(value) for value in values if value is not None)
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
+def _qqq_history_average(values):
+    clean = [float(value) for value in values if value is not None]
+    return (sum(clean) / len(clean)) if clean else None
+
+
+def _qqq_history_ema_series(values, length):
+    if not values:
+        return []
+    alpha = 2.0 / (float(length) + 1.0)
+    result = [float(values[0])]
+    for value in values[1:]:
+        result.append(
+            alpha * float(value) + (1.0 - alpha) * result[-1]
+        )
+    return result
+
+
+def _qqq_history_adx_series(highs, lows, closes, length=14):
+    """Return a Wilder ADX series aligned to the input bars."""
+    count = len(closes)
+    result = [None] * count
+    if count < (length * 2 + 1):
+        return result
+
+    tr = [0.0] * count
+    plus_dm = [0.0] * count
+    minus_dm = [0.0] * count
+
+    for index in range(1, count):
+        tr[index] = max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        )
+        up_move = highs[index] - highs[index - 1]
+        down_move = lows[index - 1] - lows[index]
+        plus_dm[index] = (
+            up_move if up_move > down_move and up_move > 0 else 0.0
+        )
+        minus_dm[index] = (
+            down_move if down_move > up_move and down_move > 0 else 0.0
+        )
+
+    atr = [None] * count
+    plus_smoothed = [None] * count
+    minus_smoothed = [None] * count
+    seed_index = length
+    atr[seed_index] = sum(tr[1:seed_index + 1]) / float(length)
+    plus_smoothed[seed_index] = (
+        sum(plus_dm[1:seed_index + 1]) / float(length)
+    )
+    minus_smoothed[seed_index] = (
+        sum(minus_dm[1:seed_index + 1]) / float(length)
+    )
+
+    for index in range(seed_index + 1, count):
+        atr[index] = (
+            atr[index - 1] * (length - 1) + tr[index]
+        ) / float(length)
+        plus_smoothed[index] = (
+            plus_smoothed[index - 1] * (length - 1) + plus_dm[index]
+        ) / float(length)
+        minus_smoothed[index] = (
+            minus_smoothed[index - 1] * (length - 1) + minus_dm[index]
+        ) / float(length)
+
+    dx = [None] * count
+    for index in range(seed_index, count):
+        if not atr[index]:
+            continue
+        plus_di = 100.0 * plus_smoothed[index] / atr[index]
+        minus_di = 100.0 * minus_smoothed[index] / atr[index]
+        denominator = plus_di + minus_di
+        dx[index] = (
+            0.0
+            if denominator == 0
+            else 100.0 * abs(plus_di - minus_di) / denominator
+        )
+
+    first_adx_index = seed_index + length - 1
+    first_dx = [
+        dx[index]
+        for index in range(seed_index, first_adx_index + 1)
+        if dx[index] is not None
+    ]
+    if len(first_dx) != length:
+        return result
+
+    result[first_adx_index] = sum(first_dx) / float(length)
+    for index in range(first_adx_index + 1, count):
+        if dx[index] is None:
+            continue
+        result[index] = (
+            result[index - 1] * (length - 1) + dx[index]
+        ) / float(length)
+    return result
+
+
+def _qqq_history_adx_bucket(value):
+    if value is None:
+        return "UNAVAILABLE"
+    if value < 15.0:
+        return "BELOW_15"
+    if value < 20.0:
+        return "15_TO_20"
+    if value < 25.0:
+        return "20_TO_25"
+    return "25_AND_ABOVE"
+
+
+def _qqq_history_round(value, places=4):
+    return round(value, places) if value is not None else ""
+
+
+def _qqq_history_summarize(events, completed_session_count):
+    horizons = ("return_15m_pct", "return_30m_pct", "return_60m_pct", "return_1545_pct")
+    summary = {
+        "trigger_days": len(events),
+        "completed_sessions": completed_session_count,
+        "trigger_frequency_pct": round(
+            (len(events) / completed_session_count) * 100.0, 2
+        ) if completed_session_count else 0.0,
+        "no_trigger_days": max(completed_session_count - len(events), 0),
+    }
+
+    for field in horizons:
+        values = [event.get(field) for event in events if event.get(field) is not None]
+        label = field.replace("_pct", "")
+        summary[label] = {
+            "observations": len(values),
+            "positive_pct": round(
+                sum(1 for value in values if value > 0) / len(values) * 100.0,
+                2,
+            ) if values else "",
+            "average_pct": _qqq_history_round(_qqq_history_average(values)),
+            "median_pct": _qqq_history_round(_qqq_history_median(values)),
+        }
+
+    summary["mfe_to_1545"] = {
+        "average_pct": _qqq_history_round(
+            _qqq_history_average([event.get("mfe_to_1545_pct") for event in events])
+        ),
+        "median_pct": _qqq_history_round(
+            _qqq_history_median([event.get("mfe_to_1545_pct") for event in events])
+        ),
+    }
+    summary["mae_to_1545"] = {
+        "average_pct": _qqq_history_round(
+            _qqq_history_average([event.get("mae_to_1545_pct") for event in events])
+        ),
+        "median_pct": _qqq_history_round(
+            _qqq_history_median([event.get("mae_to_1545_pct") for event in events])
+        ),
+    }
+
+    adx_buckets = {}
+    for bucket_name in ("BELOW_15", "15_TO_20", "20_TO_25", "25_AND_ABOVE", "UNAVAILABLE"):
+        bucket_events = [
+            event for event in events if event.get("adx_bucket") == bucket_name
+        ]
+        if not bucket_events:
+            continue
+        values_60 = [
+            event.get("return_60m_pct")
+            for event in bucket_events
+            if event.get("return_60m_pct") is not None
+        ]
+        values_close = [
+            event.get("return_1545_pct")
+            for event in bucket_events
+            if event.get("return_1545_pct") is not None
+        ]
+        adx_buckets[bucket_name] = {
+            "triggers": len(bucket_events),
+            "positive_60m_pct": round(
+                sum(1 for value in values_60 if value > 0) / len(values_60) * 100.0,
+                2,
+            ) if values_60 else "",
+            "average_60m_pct": _qqq_history_round(_qqq_history_average(values_60)),
+            "median_60m_pct": _qqq_history_round(_qqq_history_median(values_60)),
+            "positive_1545_pct": round(
+                sum(1 for value in values_close if value > 0) / len(values_close) * 100.0,
+                2,
+            ) if values_close else "",
+            "average_1545_pct": _qqq_history_round(_qqq_history_average(values_close)),
+            "median_1545_pct": _qqq_history_round(_qqq_history_median(values_close)),
+        }
+    summary["adx_buckets"] = adx_buckets
+    return summary
+
+
+@app.get("/odts-qqq-stage1-history")
+def odts_qqq_stage1_history():
+    """
+    Compare first-daily QQQ bullish signals over historical 3-minute bars.
+
+    This route reads QQQ underlying OHLCV bars only. It does not request an
+    option chain and has no order, confirmation, approval, or execution call.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    try:
+        requested_days = int(request.args.get("days", "183"))
+    except (TypeError, ValueError):
+        requested_days = 183
+    requested_days = max(30, min(requested_days, 365))
+
+    end_et = now_et()
+    start_et = end_et - timedelta(days=requested_days)
+    bars_url = f"{TS_API_BASE_URL}/marketdata/barcharts/QQQ"
+    params = {
+        "interval": "3",
+        "unit": "Minute",
+        "firstdate": start_et.astimezone(timezone.utc).isoformat(),
+        "lastdate": end_et.astimezone(timezone.utc).isoformat(),
+        "sessiontemplate": "Default",
+    }
+
+    try:
+        response = requests.get(
+            bars_url,
+            headers=ts_headers(access_token),
+            params=params,
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": f"QQQ historical-bar request failed: {exc}",
+        }), 502
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "status_code": response.status_code,
+            "response": response.text[:1000],
+        }), response.status_code
+
+    try:
+        body = response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": "TradeStation historical bars were not valid JSON.",
+        }), 502
+
+    raw_bars = body.get("Bars", []) if isinstance(body, dict) else []
+    parsed_bars = []
+    for raw_bar in raw_bars if isinstance(raw_bars, list) else []:
+        try:
+            raw_timestamp = str(raw_bar.get("TimeStamp", "")).strip()
+            bar_dt = datetime.fromisoformat(
+                raw_timestamp.replace("Z", "+00:00")
+            ).astimezone(ET)
+            high = float(raw_bar.get("High"))
+            low = float(raw_bar.get("Low"))
+            close = float(raw_bar.get("Close"))
+            volume = float(raw_bar.get("TotalVolume", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        minute_of_day = bar_dt.hour * 60 + bar_dt.minute
+        if not (570 <= minute_of_day <= 960):
+            continue
+        parsed_bars.append({
+            "dt": bar_dt,
+            "date": bar_dt.date(),
+            "minute": minute_of_day,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        })
+
+    parsed_bars.sort(key=lambda item: item["dt"])
+    if len(parsed_bars) < 100:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": "Not enough completed QQQ 3-minute bars were returned.",
+            "bars_received": len(parsed_bars),
+        }), 502
+
+    highs = [bar["high"] for bar in parsed_bars]
+    lows = [bar["low"] for bar in parsed_bars]
+    closes = [bar["close"] for bar in parsed_bars]
+    ema21 = _qqq_history_ema_series(closes, 21)
+
+    zlema_length = 5
+    zlema_lag = int((zlema_length - 1) / 2)
+    adjusted = []
+    for index, close in enumerate(closes):
+        adjusted.append(
+            close
+            if index < zlema_lag
+            else close + (close - closes[index - zlema_lag])
+        )
+    zlema5 = _qqq_history_ema_series(adjusted, zlema_length)
+    adx14 = _qqq_history_adx_series(highs, lows, closes, 14)
+
+    session_pv = 0.0
+    session_volume = 0.0
+    current_session = None
+    vwap = []
+    indices_by_date = {}
+    for index, bar in enumerate(parsed_bars):
+        if bar["date"] != current_session:
+            current_session = bar["date"]
+            session_pv = 0.0
+            session_volume = 0.0
+        typical_price = (bar["high"] + bar["low"] + bar["close"]) / 3.0
+        session_pv += typical_price * bar["volume"]
+        session_volume += bar["volume"]
+        vwap.append(
+            session_pv / session_volume if session_volume > 0 else None
+        )
+        indices_by_date.setdefault(bar["date"], []).append(index)
+
+    completed_dates = []
+    for session_date, indices in indices_by_date.items():
+        if any(parsed_bars[index]["minute"] >= 945 for index in indices):
+            completed_dates.append(session_date)
+    completed_dates.sort()
+
+    variants = {
+        "ZLEMA_ONLY": lambda index: True,
+        "ZLEMA_ABOVE_EMA21": lambda index: closes[index] > ema21[index],
+        "ZLEMA_ABOVE_VWAP": lambda index: (
+            vwap[index] is not None and closes[index] > vwap[index]
+        ),
+        "ZLEMA_ABOVE_EITHER": lambda index: (
+            closes[index] > ema21[index]
+            or (vwap[index] is not None and closes[index] > vwap[index])
+        ),
+        "ZLEMA_ABOVE_BOTH": lambda index: (
+            vwap[index] is not None
+            and closes[index] > ema21[index]
+            and closes[index] > vwap[index]
+        ),
+    }
+    events_by_variant = {name: [] for name in variants}
+
+    for session_date in completed_dates:
+        session_indices = indices_by_date[session_date]
+        analysis_indices = [
+            index for index in session_indices
+            if 600 <= parsed_bars[index]["minute"] < 900
+        ]
+        exit_indices = [
+            index for index in session_indices
+            if parsed_bars[index]["minute"] <= 945
+        ]
+        if not analysis_indices or not exit_indices:
+            continue
+        exit_1545_index = exit_indices[-1]
+
+        for variant_name, extra_condition in variants.items():
+            trigger_index = None
+            for index in analysis_indices:
+                if index < 2:
+                    continue
+                zlema_confirmed_bullish = (
+                    zlema5[index] > zlema5[index - 1]
+                    and zlema5[index - 1] > zlema5[index - 2]
+                )
+                if zlema_confirmed_bullish and extra_condition(index):
+                    trigger_index = index
+                    break
+
+            if trigger_index is None:
+                continue
+
+            entry = closes[trigger_index]
+            trigger_dt = parsed_bars[trigger_index]["dt"]
+
+            def forward_return(minutes):
+                target = trigger_dt + timedelta(minutes=minutes)
+                for candidate in session_indices:
+                    if candidate <= trigger_index:
+                        continue
+                    if parsed_bars[candidate]["dt"] >= target:
+                        if candidate > exit_1545_index:
+                            return None
+                        return (closes[candidate] / entry - 1.0) * 100.0
+                return None
+
+            path_indices = [
+                index for index in session_indices
+                if trigger_index <= index <= exit_1545_index
+            ]
+            path_high = max(highs[index] for index in path_indices)
+            path_low = min(lows[index] for index in path_indices)
+            event = {
+                "date": session_date.isoformat(),
+                "trigger_time_et": trigger_dt.strftime("%H:%M"),
+                "entry_price": round(entry, 4),
+                "ema21": round(ema21[trigger_index], 4),
+                "vwap": _qqq_history_round(vwap[trigger_index]),
+                "adx14": _qqq_history_round(adx14[trigger_index]),
+                "adx_bucket": _qqq_history_adx_bucket(adx14[trigger_index]),
+                "return_15m_pct": forward_return(15),
+                "return_30m_pct": forward_return(30),
+                "return_60m_pct": forward_return(60),
+                "return_1545_pct": (
+                    closes[exit_1545_index] / entry - 1.0
+                ) * 100.0,
+                "mfe_to_1545_pct": (path_high / entry - 1.0) * 100.0,
+                "mae_to_1545_pct": (path_low / entry - 1.0) * 100.0,
+            }
+            events_by_variant[variant_name].append(event)
+
+    summaries = {
+        name: _qqq_history_summarize(events, len(completed_dates))
+        for name, events in events_by_variant.items()
+    }
+
+    eligible_for_preliminary_choice = []
+    for name, summary in summaries.items():
+        sixty = summary.get("return_60m", {})
+        if summary.get("trigger_days", 0) >= 20 and sixty.get("positive_pct", "") != "":
+            eligible_for_preliminary_choice.append((
+                float(sixty["positive_pct"]),
+                float(sixty.get("median_pct", 0) or 0),
+                int(summary["trigger_days"]),
+                name,
+            ))
+    eligible_for_preliminary_choice.sort(reverse=True)
+    preliminary_choice = (
+        eligible_for_preliminary_choice[0][3]
+        if eligible_for_preliminary_choice
+        else "INSUFFICIENT_SAMPLE"
+    )
+
+    recent_examples = {
+        name: [
+            {
+                key: (_qqq_history_round(value) if isinstance(value, float) else value)
+                for key, value in event.items()
+            }
+            for event in events[-5:]
+        ]
+        for name, events in events_by_variant.items()
+    }
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "option_data_requested": False,
+        "project": "QQQ_STAGE1_HISTORY",
+        "underlying": "QQQ",
+        "purpose": (
+            "Measure the first bullish underlying signal per completed session "
+            "before applying any option-contract rules."
+        ),
+        "requested_calendar_days": requested_days,
+        "first_bar_et": parsed_bars[0]["dt"].isoformat(),
+        "last_bar_et": parsed_bars[-1]["dt"].isoformat(),
+        "regular_session_3_minute_bars": len(parsed_bars),
+        "completed_sessions": len(completed_dates),
+        "definitions": {
+            "timeframe": "3 Minute",
+            "entry_window_et": "10:00-15:00",
+            "first_trigger_per_variant_per_day": True,
+            "zlema_length": 5,
+            "zlema_confirmation": "Two consecutive rising closed-bar values",
+            "ema_length": 21,
+            "vwap": "Session VWAP reset each trading date",
+            "adx_length": 14,
+            "adx_is_a_study_bucket_not_an_entry_gate": True,
+            "outcome_horizons": ["15m", "30m", "60m", "15:45 ET"],
+        },
+        "preliminary_best_60m_directional_variant": preliminary_choice,
+        "variant_results": summaries,
+        "recent_trigger_examples": recent_examples,
+        "limitations": [
+            "Underlying QQQ direction study only; this is not option P/L.",
+            "No commissions, spread slippage, or option Greeks are modeled.",
+            "The preliminary variant is in-sample and must remain SIM/read-only.",
+        ],
+        "safety": "READ ONLY - NO OPTION CHAIN AND NO ORDER CAPABILITY",
+    }), 200
 
 
 if __name__ == "__main__":
