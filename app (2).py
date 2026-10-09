@@ -1,0 +1,9559 @@
+import os
+import time
+import secrets
+import logging
+import csv
+import json
+import threading
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
+
+import requests
+from flask import Flask, jsonify, redirect, request, send_file
+
+app = Flask(__name__)
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("zerolag")
+
+TS_CLIENT_ID = os.getenv("TS_CLIENT_ID", "").strip()
+TS_CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET", "").strip()
+TS_REDIRECT_URI = os.getenv("TS_REDIRECT_URI", "").strip()
+TS_API_BASE_URL = os.getenv(
+    "TS_API_BASE_URL",
+    "https://sim-api.tradestation.com/v3"
+).rstrip("/")
+TS_LIVE_API_BASE_URL = "https://api.tradestation.com/v3"
+TS_SIM_ACCOUNT_ID = os.getenv("TS_SIM_ACCOUNT_ID", "").strip()
+TS_LIVE_ACCOUNT_ID = os.getenv("TS_LIVE_ACCOUNT_ID", "").strip()
+
+# Master switch used by the existing service. Keep YES only when execution is intended.
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "NO").strip().upper()
+
+# SOXL Regular can be routed independently. Default remains SIM.
+SOXL_REGULAR_EXECUTION_MODE = os.getenv(
+    "SOXL_REGULAR_EXECUTION_MODE",
+    "SIM"
+).strip().upper()
+
+# SOXL Overnight can be routed independently. Default remains SIM.
+SOXL_OVERNIGHT_EXECUTION_MODE = os.getenv(
+    "SOXL_OVERNIGHT_EXECUTION_MODE",
+    "SIM"
+).strip().upper()
+
+# Second, independent gate required before any LIVE order can be sent.
+LIVE_TRADING_ENABLED = os.getenv(
+    "LIVE_TRADING_ENABLED",
+    "NO"
+).strip().upper()
+
+# Independent master gate for ODTS QQQ option execution in TradeStation SIM.
+# Default NO so deployment alone can never submit an option order.
+ODTS_SIM_TRADING_ENABLED = os.getenv(
+    "ODTS_SIM_TRADING_ENABLED",
+    "NO"
+).strip().upper()
+
+# Independent master gate for ODTS QQQ SIM exits. Default NO.
+ODTS_SIM_EXIT_ENABLED = os.getenv(
+    "ODTS_SIM_EXIT_ENABLED",
+    "NO"
+).strip().upper()
+
+# Independent gate for the ODTS background position monitor.
+# Default NO: deployment alone never starts automatic exit monitoring.
+ODTS_CONTINUOUS_MONITOR_ENABLED = os.getenv(
+    "ODTS_CONTINUOUS_MONITOR_ENABLED",
+    "NO"
+).strip().upper()
+
+try:
+    ODTS_MONITOR_INTERVAL_SECONDS = max(
+        3.0,
+        float(os.getenv("ODTS_MONITOR_INTERVAL_SECONDS", "5"))
+    )
+except (TypeError, ValueError):
+    ODTS_MONITOR_INTERVAL_SECONDS = 5.0
+
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+
+# ==============================================================
+# ODTS QQQ EMAIL APPROVAL ALERT SETTINGS
+# ==============================================================
+# Notification-only feature. It cannot place, modify, cancel, or close orders.
+ODTS_EMAIL_SENDER = os.getenv("ODTS_EMAIL_SENDER", "").strip()
+ODTS_EMAIL_RECIPIENT = os.getenv("ODTS_EMAIL_RECIPIENT", "").strip()
+ODTS_EMAIL_APP_PASSWORD = "".join(os.getenv("ODTS_EMAIL_APP_PASSWORD", "").split())
+ODTS_EMAIL_ALERT_ENABLED = os.getenv("ODTS_EMAIL_ALERT_ENABLED", "YES").strip().upper()
+
+try:
+    ODTS_EMAIL_ALERT_INTERVAL_SECONDS = max(
+        30.0,
+        float(os.getenv("ODTS_EMAIL_ALERT_INTERVAL_SECONDS", "30"))
+    )
+except (TypeError, ValueError):
+    ODTS_EMAIL_ALERT_INTERVAL_SECONDS = 30.0
+
+TS_AUTHORIZE_URL = "https://signin.tradestation.com/authorize"
+TS_TOKEN_URL = "https://signin.tradestation.com/oauth/token"
+TS_AUDIENCE = "https://api.tradestation.com"
+TS_SCOPES = "openid profile offline_access MarketData ReadAccount Trade OptionSpreads"
+
+# ==============================================================
+# SIM SAFETY SETTINGS
+# ==============================================================
+
+ALLOWED_SYMBOL = "SOXL"
+
+ALLOWED_STRATEGIES = {
+    "SOXL_REGULAR",
+    "SOXL_OVERNIGHT",
+}
+
+MAX_TEST_QTY = 1
+MAX_LIVE_SHARE_QTY = 10
+DUPLICATE_WINDOW_SECONDS = 20
+
+
+# ==============================================================
+# EXECUTION JOURNAL SETTINGS
+# ==============================================================
+
+JOURNAL_DIR = os.getenv(
+    "JOURNAL_DIR",
+    "/tmp/zerolag_journal"
+).strip()
+
+TV_TIMEFRAME = os.getenv("TV_TIMEFRAME", "5m").strip()
+
+ET = ZoneInfo("America/New_York")
+
+TV_CSV_PATH = os.path.join(
+    JOURNAL_DIR,
+    "TV_Signals.csv"
+)
+
+TS_CSV_PATH = os.path.join(
+    JOURNAL_DIR,
+    "TS_Executions.csv"
+)
+
+TV_HEADERS = [
+    "Date",
+    "TV Time",
+    "Symbol",
+    "Action",
+    "TV Price",
+    "Qty",
+    "Strategy",
+    "Time Frame",
+    "Alert Status",
+]
+
+TS_HEADERS = [
+    "Symbol",
+    "Qty",
+    "AvgPrice",
+    "OpenPL",
+    "Pos",
+    "Action",
+    "FillQty",
+    "FillPrice",
+    "OrdState",
+    "TradePL",
+    "DayPL",
+    "Last",
+    "Bid",
+    "Ask",
+    "Net%",
+    "VTot",
+    "Dollar_Vol",
+    "RS_Volume_Ratio",
+    "VWAP",
+    "Int",
+]
+
+journal_lock = threading.Lock()
+
+
+# Serializes LIVE position-check + order submission so two webhooks
+# cannot pass the position gate at the same time.
+live_order_lock = threading.Lock()
+
+# Completely separate lock/state for ODTS QQQ option approvals/orders.
+odts_order_lock = threading.Lock()
+odts_proposals = {}
+odts_last_order = {
+    "proposal_id": None,
+    "symbol": None,
+    "order_id": None,
+    "limit_price": None,
+    "time": 0,
+}
+
+odts_monitor_lock = threading.Lock()
+odts_monitor_state = {
+    "thread_started": False,
+    "running": False,
+    "symbol": None,
+    "last_check_at": None,
+    "last_status": "NOT_STARTED",
+    "last_decision": "WAIT",
+    "last_bid": None,
+    "stop_price": None,
+    "target_price": None,
+    "exit_order_sent": False,
+    "exit_response": None,
+    "last_error": None,
+}
+
+# Completely separate notification-only state. No order functions are called.
+odts_email_lock = threading.Lock()
+odts_email_state = {
+    "thread_started": False,
+    "running": False,
+    "armed": True,
+    "last_check_at": None,
+    "last_status": "NOT_STARTED",
+    "last_decision": "WAIT",
+    "last_option_symbol": None,
+    "last_email_sent_at": None,
+    "last_email_subject": None,
+    "last_error": None,
+}
+
+ODTS_PROPOSAL_TTL_SECONDS = 120
+ODTS_DUPLICATE_WINDOW_SECONDS = 60
+ODTS_MAX_ASK_INCREASE_PCT = 5.0
+
+oauth_state = None
+
+token_store = {
+    "access_token": None,
+    "refresh_token": None,
+    "expires_at": 0,
+}
+
+last_webhook = {
+    "received": False,
+    "payload": None,
+    "received_at": None,
+}
+
+last_signal = {
+    "key": None,
+    "time": 0,
+}
+
+
+# ==============================================================
+# JOURNAL FUNCTIONS
+# ==============================================================
+
+def ensure_journal_files():
+    os.makedirs(
+        JOURNAL_DIR,
+        exist_ok=True
+    )
+
+    for path, headers in [
+        (TV_CSV_PATH, TV_HEADERS),
+        (TS_CSV_PATH, TS_HEADERS),
+    ]:
+        if (
+            not os.path.exists(path)
+            or os.path.getsize(path) == 0
+        ):
+            with open(
+                path,
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as f:
+                csv.writer(f).writerow(headers)
+
+
+def append_csv(path, headers, row):
+    try:
+        ensure_journal_files()
+
+        with journal_lock:
+            with open(
+                path,
+                "a",
+                newline="",
+                encoding="utf-8"
+            ) as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=headers
+                )
+
+                writer.writerow(
+                    {
+                        h: row.get(h, "")
+                        for h in headers
+                    }
+                )
+
+        return True
+
+    except Exception as exc:
+        log.exception(
+            "JOURNAL WRITE FAILED | path=%s | error=%s",
+            path,
+            exc
+        )
+
+        return False
+
+
+def now_et():
+    return datetime.now(ET)
+
+
+def normalize_tv_time(payload):
+    raw = (
+        payload.get("tv_time")
+        or payload.get("time")
+        or payload.get("timestamp")
+    )
+
+    if raw:
+        return str(raw)
+
+    return now_et().strftime("%H:%M:%S")
+
+
+def journal_tv_signal(
+    payload,
+    action,
+    symbol,
+    strategy_name
+):
+    dt = now_et()
+
+    row = {
+        "Date": dt.strftime("%Y-%m-%d"),
+        "TV Time": normalize_tv_time(payload),
+        "Symbol": symbol,
+        "Action": action,
+        "TV Price": payload.get("price", ""),
+        "Qty": payload.get(
+            "qty",
+            payload.get("size", "")
+        ),
+        "Strategy": strategy_name,
+        "Time Frame": payload.get(
+            "timeframe",
+            payload.get(
+                "interval",
+                TV_TIMEFRAME
+            )
+        ),
+        "Alert Status": "RECEIVED",
+    }
+
+    append_csv(
+
+        TV_CSV_PATH,
+        TV_HEADERS,
+        row
+    )
+
+
+# ==============================================================
+# TRADESTATION ORDER/POSITION HELPERS
+# ==============================================================
+
+def extract_first_position(body):
+    if not isinstance(body, dict):
+        return None
+
+    positions = body.get(
+        "Positions",
+        []
+    )
+
+    if not isinstance(
+        positions,
+        list
+    ):
+        return None
+
+    for position in positions:
+        if (
+            str(
+                position.get(
+                    "Symbol",
+                    ""
+                )
+            )
+            .upper()
+            .strip()
+            == ALLOWED_SYMBOL
+        ):
+            return position
+
+    return None
+
+
+def extract_order_id(order_response):
+    if not isinstance(
+        order_response,
+        dict
+    ):
+        return None
+
+    orders = order_response.get(
+        "Orders",
+        []
+    )
+
+    if (
+        isinstance(orders, list)
+        and orders
+        and isinstance(
+            orders[0],
+            dict
+        )
+    ):
+        value = (
+            orders[0].get("OrderID")
+            or orders[0].get("OrderId")
+        )
+
+        if value is not None:
+            return str(value)
+
+    return None
+
+
+def fetch_order_details(
+    access_token,
+    order_id
+):
+    if not order_id:
+        return None
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/brokerage/accounts/"
+        f"{TS_SIM_ACCOUNT_ID}"
+        f"/orders"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(
+                access_token
+            ),
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        log.warning(
+            "ORDER JOURNAL QUERY FAILED | %s",
+            exc
+        )
+
+        return None
+
+    if not response.ok:
+        log.warning(
+            "ORDER JOURNAL QUERY FAILED | status=%s body=%s",
+            response.status_code,
+            response.text[:500]
+        )
+
+        return None
+
+    try:
+        body = response.json()
+
+    except ValueError:
+        return None
+
+    orders = (
+        body.get("Orders", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(
+        orders,
+        list
+    ):
+        return None
+
+    for order in orders:
+        candidate = str(
+            order.get("OrderID")
+            or order.get("OrderId")
+            or ""
+        )
+
+        if candidate == str(order_id):
+            return order
+
+    return None
+
+
+def journal_ts_execution_background(
+    access_token,
+    action,
+    order_response
+):
+    try:
+        time.sleep(1.25)
+
+        order_id = extract_order_id(
+            order_response
+        )
+
+        order_detail = fetch_order_details(
+            access_token,
+            order_id
+        )
+
+        (
+            pos_ok,
+            position_qty,
+            position_body
+        ) = get_soxl_position(
+            access_token
+        )
+
+        position = (
+            extract_first_position(
+                position_body
+            )
+            if pos_ok
+            else None
+        )
+
+        qty = (
+            position_qty
+            if pos_ok
+
+            else ""
+        )
+
+        avg_price = ""
+        open_pl = ""
+        pos_text = ""
+
+        if position:
+            avg_price = (
+                position.get(
+                    "AveragePrice"
+                )
+                or position.get(
+                    "AvgPrice"
+                )
+                or ""
+            )
+
+            open_pl = (
+                position.get(
+                    "UnrealizedProfitLoss"
+                )
+                or position.get(
+                    "OpenPL"
+                )
+                or ""
+            )
+
+        if pos_ok:
+            if position_qty > 0:
+                pos_text = "LONG"
+
+            elif position_qty < 0:
+                pos_text = "SHORT"
+
+            else:
+                pos_text = "FLAT"
+
+        fill_qty = MAX_TEST_QTY
+        fill_price = ""
+        order_state = "SENT"
+
+        if order_detail:
+            fill_qty = (
+                order_detail.get(
+                    "FilledQuantity"
+                )
+                or order_detail.get(
+                    "Quantity"
+                )
+                or MAX_TEST_QTY
+            )
+
+            fill_price = (
+                order_detail.get(
+                    "FilledPrice"
+                )
+                or order_detail.get(
+                    "AverageFilledPrice"
+                )
+                or ""
+            )
+
+            order_state = (
+                order_detail.get(
+                    "Status"
+                )
+                or order_detail.get(
+                    "State"
+                )
+                or order_detail.get(
+                    "OrderStatus"
+                )
+                or "SENT"
+            )
+
+        if (
+            not fill_price
+            and action == "BUY"
+            and avg_price
+        ):
+            fill_price = avg_price
+
+        row = {
+            "Symbol": ALLOWED_SYMBOL,
+            "Qty": qty,
+            "AvgPrice": avg_price,
+            "OpenPL": open_pl,
+            "Pos": pos_text,
+            "Action": action,
+            "FillQty": fill_qty,
+            "FillPrice": fill_price,
+            "OrdState": order_state,
+            "TradePL": "",
+            "DayPL": "",
+            "Last": "",
+            "Bid": "",
+            "Ask": "",
+            "Net%": "",
+            "VTot": "",
+            "Dollar_Vol": "",
+            "RS_Volume_Ratio": "",
+            "VWAP": "",
+            "Int": TV_TIMEFRAME,
+        }
+
+        append_csv(
+            TS_CSV_PATH,
+            TS_HEADERS,
+            row
+        )
+
+        log.info(
+            "JOURNAL TS SAVED | action=%s order_id=%s fill_price=%s state=%s",
+            action,
+            order_id,
+            fill_price,
+            order_state
+        )
+
+    except Exception as exc:
+        log.exception(
+            "TS JOURNAL BACKGROUND ERROR | %s",
+            exc
+        )
+
+
+ensure_journal_files()
+
+
+# ==============================================================
+# SIM SAFETY / CONFIGURATION
+# ==============================================================
+
+def sim_environment_ok():
+    return (
+        TS_API_BASE_URL
+        .lower()
+        .startswith(
+            "https://sim-api.tradestation.com/v3"
+        )
+    )
+
+
+def order_capability_ready():
+    return bool(
+        sim_environment_ok()
+        and TS_CLIENT_ID
+        and TS_CLIENT_SECRET
+        and TS_REDIRECT_URI
+        and TS_SIM_ACCOUNT_ID
+        and WEBHOOK_TOKEN
+    )
+
+
+def missing_config():
+    missing = []
+
+    for name, value in [
+        ("TS_CLIENT_ID", TS_CLIENT_ID),
+        (
+            "TS_CLIENT_SECRET",
+            TS_CLIENT_SECRET
+        ),
+        (
+            "TS_REDIRECT_URI",
+            TS_REDIRECT_URI
+        ),
+        (
+            "TS_SIM_ACCOUNT_ID",
+            TS_SIM_ACCOUNT_ID
+        ),
+        (
+            "WEBHOOK_TOKEN",
+            WEBHOOK_TOKEN
+        ),
+    ]:
+        if not value:
+            missing.append(name)
+
+
+    return missing
+
+
+def live_regular_mode_selected():
+    return SOXL_REGULAR_EXECUTION_MODE == "LIVE"
+
+
+def live_overnight_mode_selected():
+    return SOXL_OVERNIGHT_EXECUTION_MODE == "LIVE"
+
+
+def live_strategy_mode_selected(strategy_name):
+    if strategy_name == "SOXL_REGULAR":
+        return live_regular_mode_selected()
+
+    if strategy_name == "SOXL_OVERNIGHT":
+        return live_overnight_mode_selected()
+
+    return False
+
+
+def live_order_capability_ready():
+    return bool(
+        TS_CLIENT_ID
+        and TS_CLIENT_SECRET
+        and TS_REDIRECT_URI
+        and TS_LIVE_ACCOUNT_ID
+        and WEBHOOK_TOKEN
+    )
+
+
+def parse_share_quantity(payload):
+    """Return a safe whole-share quantity supplied by TradingView."""
+    raw_value = payload.get("qty", payload.get("size"))
+
+    try:
+        numeric_value = float(raw_value)
+    except (TypeError, ValueError):
+        return (None, "qty must be a positive whole number")
+
+    if (
+        not numeric_value.is_integer()
+        or numeric_value <= 0
+    ):
+        return (None, "qty must be a positive whole number")
+
+    if numeric_value > MAX_LIVE_SHARE_QTY:
+        return (
+            None,
+            f"qty exceeds the maximum permitted live quantity of "
+            f"{MAX_LIVE_SHARE_QTY} shares"
+        )
+
+    return (int(numeric_value), None)
+
+
+def live_market_session_now():
+    """
+    LIVE orders in this version are intentionally restricted to the
+    regular U.S. equity session. The Overnight strategy may HOLD a
+    position overnight, but its entry/exit orders must arrive between
+    09:30 and 16:00 ET.
+    """
+    dt = now_et()
+
+    # Monday=0 ... Sunday=6
+    if dt.weekday() > 4:
+        return False
+
+    minutes = dt.hour * 60 + dt.minute
+    return (9 * 60 + 30) <= minutes < (16 * 60)
+
+
+def live_regular_session_now():
+    # Backward-compatible alias used by older status/test code.
+    return live_market_session_now()
+
+
+def odts_sim_session_now():
+    """ODTS V1 entries are restricted to the regular QQQ session."""
+    return live_market_session_now()
+
+
+def odts_sim_environment_ok():
+    base = TS_API_BASE_URL.lower()
+    return "sim-api.tradestation.com" in base
+
+
+# ==============================================================
+# OAUTH
+# ==============================================================
+
+def save_token_response(data):
+    token_store["access_token"] = (
+        data.get("access_token")
+    )
+
+    if data.get("refresh_token"):
+        token_store["refresh_token"] = (
+            data.get("refresh_token")
+        )
+
+    expires_in = int(
+        data.get(
+            "expires_in",
+            1200
+        )
+    )
+
+    token_store["expires_at"] = (
+        time.time()
+        + max(
+            expires_in - 60,
+            60
+        )
+    )
+
+
+def refresh_access_token():
+    refresh_token = (
+        token_store.get(
+            "refresh_token"
+        )
+    )
+
+    if not refresh_token:
+        return (
+            False,
+            "No refresh token is available. "
+            "Please visit /login again."
+        )
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": TS_CLIENT_ID,
+        "client_secret": TS_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+    }
+
+    try:
+        response = requests.post(
+            TS_TOKEN_URL,
+            data=payload,
+            headers={
+                "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return (
+            False,
+            f"Refresh request failed: {exc}"
+        )
+
+    if not response.ok:
+        return (
+            False,
+            f"Refresh failed "
+            f"({response.status_code}): "
+            f"{response.text[:500]}"
+        )
+
+    data = response.json()
+
+    if not data.get("access_token"):
+        return (
+            False,
+            "TradeStation refresh response "
+            "did not include an access token."
+        )
+
+    save_token_response(data)
+
+    return (
+        True,
+        "Access token refreshed."
+    )
+
+
+def get_valid_access_token():
+    access_token = (
+        token_store.get(
+            "access_token"
+        )
+    )
+
+    if (
+        access_token
+        and time.time()
+        < token_store.get(
+            "expires_at",
+            0
+        )
+    ):
+        return (
+            access_token,
+            None
+        )
+
+    if token_store.get(
+        "refresh_token"
+    ):
+
+        ok, message = (
+            refresh_access_token()
+        )
+
+        if ok:
+            return (
+                token_store.get(
+                    "access_token"
+                ),
+                None
+            )
+
+        return (
+            None,
+            message
+        )
+
+    return (
+        None,
+        "Not authenticated. "
+        "Please visit /login first."
+    )
+
+
+def ts_headers(access_token):
+    return {
+        "Authorization":
+            f"Bearer {access_token}",
+        "Accept":
+            "application/json",
+        "Content-Type":
+            "application/json",
+    }
+
+
+# ==============================================================
+# ODTS QQQ UNDERLYING QUOTE TEST
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-qqq-test")
+def odts_qqq_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    symbol = "QQQ"
+
+    encoded_symbol = requests.utils.quote(
+        symbol,
+        safe=""
+    )
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/quotes/"
+        f"{encoded_symbol}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=20
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "symbol": symbol,
+                "status_code": response.status_code,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            text = line.decode("utf-8").strip()
+
+            try:
+                quote = json.loads(text)
+            except Exception:
+                quote = {"raw": text}
+
+            response.close()
+
+            return jsonify({
+                "ok": True,
+                "read_only": True,
+                "order_sent": False,
+                "symbol": symbol,
+                "bid": quote.get("Bid", ""),
+                "ask": quote.get("Ask", ""),
+                "last": quote.get("Last", ""),
+                "volume": quote.get("Volume", ""),
+                "previous_close": quote.get("PreviousClose", ""),
+                "net_change": quote.get("NetChange", ""),
+                "net_change_pct": quote.get("NetChangePct", "")
+            })
+
+        response.close()
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": "No QQQ quote data was returned."
+        }), 502
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": f"QQQ quote request failed: {exc}"
+        }), 502
+
+
+# ==============================================================
+# NVDA COVERED CALL - UNDERLYING QUOTE TEST
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-test")
+def odts_nvda_covered_call_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    symbol = "NVDA"
+
+    encoded_symbol = requests.utils.quote(
+        symbol,
+        safe=""
+    )
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/quotes/"
+        f"{encoded_symbol}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=20
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "symbol": symbol,
+                "status_code": response.status_code,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+
+            text = line.decode("utf-8").strip()
+
+            try:
+                quote = json.loads(text)
+            except Exception:
+                quote = {"raw": text}
+
+            response.close()
+
+            return jsonify({
+                "ok": True,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "symbol": symbol,
+                "bid": quote.get("Bid", ""),
+                "ask": quote.get("Ask", ""),
+                "last": quote.get("Last", ""),
+                "volume": quote.get("Volume", ""),
+                "previous_close": quote.get("PreviousClose", ""),
+                "net_change": quote.get("NetChange", ""),
+                "net_change_pct": quote.get("NetChangePct", "")
+            })
+
+        response.close()
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "symbol": symbol,
+            "error": "No NVDA quote data was returned."
+        }), 502
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "symbol": symbol,
+            "error": f"NVDA quote request failed: {exc}"
+        }), 502
+
+
+# ==============================================================
+# NVDA COVERED CALL - EXACT OPTION CONTRACT QUOTE (READ ONLY)
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-option-test")
+def odts_nvda_covered_call_option_test():
+    """Return one exact NVDA call contract for Excel decision support.
+
+    This endpoint is permanently read-only.  It cannot submit an order.
+    Query parameters make it possible to change the contract later without
+    another GitHub/Render code change, for example:
+      ?expiration=09-25-2026&strike=250
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    underlying = "NVDA"
+    expiration_raw = str(
+        request.args.get("expiration", "09-25-2026")
+    ).strip()
+    strike_raw = str(request.args.get("strike", "250")).strip()
+
+    try:
+        expiration_date = datetime.strptime(
+            expiration_raw, "%m-%d-%Y"
+        ).date()
+        strike_target = float(strike_raw)
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "error": (
+                "Use expiration=MM-DD-YYYY and a numeric strike."
+            )
+        }), 400
+
+    chain_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/options/chains/{underlying}"
+    )
+    chain_params = {
+        "expiration": expiration_date.strftime("%m-%d-%Y"),
+        "strikeProximity": 40,
+        "spreadType": "Single",
+        "enableGreeks": "true",
+        "optionType": "Call",
+    }
+
+    def number(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def whole(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    response = None
+
+    try:
+        response = requests.get(
+            chain_url,
+            headers=ts_headers(access_token),
+            params=chain_params,
+            stream=True,
+            timeout=(5, 6)
+        )
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "NVDA_COVERED_CALL",
+                "status_code": response.status_code,
+                "response": response.text[:1000]
+            }), response.status_code
+
+        message_count = 0
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+
+            if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                break
+            if item.get("Error"):
+                continue
+
+            message_count += 1
+            legs = item.get("Legs", [])
+            leg = (
+                legs[0]
+                if isinstance(legs, list)
+                and legs
+                and isinstance(legs[0], dict)
+                else {}
+            )
+
+            option_type = str(
+                item.get("Side") or leg.get("OptionType") or ""
+            ).strip().upper()
+            strike = number(leg.get("StrikePrice"))
+            if strike is None:
+                strikes = item.get("Strikes", [])
+                if isinstance(strikes, list) and strikes:
+                    strike = number(strikes[0])
+
+
+            if (
+                option_type == "CALL"
+                and strike is not None
+                and abs(strike - strike_target) < 0.0001
+            ):
+                bid = number(item.get("Bid"))
+                ask = number(item.get("Ask"))
+                last = number(item.get("Last"))
+                mid = number(item.get("Mid"))
+                if mid is None and bid is not None and ask is not None:
+                    mid = (bid + ask) / 2.0
+
+                spread = (
+                    ask - bid
+                    if bid is not None and ask is not None
+                    else None
+                )
+                spread_pct = (
+                    spread / mid
+                    if spread is not None and mid not in (None, 0)
+                    else None
+                )
+
+                return jsonify({
+                    "ok": True,
+                    "read_only": True,
+                    "order_sent": False,
+                    "project": "NVDA_COVERED_CALL",
+                    "underlying": underlying,
+                    "symbol": str(
+                        leg.get("Symbol") or item.get("Symbol") or ""
+                    ).strip(),
+                    "option_type": "Call",
+                    "expiration": expiration_date.isoformat(),
+                    "dte": (expiration_date - now_et().date()).days,
+                    "strike": strike,
+                    "bid": bid if bid is not None else "",
+                    "ask": ask if ask is not None else "",
+                    "last": last if last is not None else "",
+                    "mid": mid if mid is not None else "",
+                    "spread": spread if spread is not None else "",
+                    "spread_pct": (
+                        spread_pct if spread_pct is not None else ""
+                    ),
+                    "delta": number(item.get("Delta"), ""),
+                    "implied_volatility": number(
+                        item.get("ImpliedVolatility"), ""
+                    ),
+                    "volume": whole(item.get("Volume"), 0),
+                    "open_interest": whole(
+                        item.get("DailyOpenInterest"), 0
+                    ),
+                    "gamma": number(item.get("Gamma"), ""),
+                    "theta": number(item.get("Theta"), ""),
+                    "vega": number(item.get("Vega"), ""),
+                }), 200
+
+            if message_count >= 200:
+                break
+
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "underlying": underlying,
+            "expiration": expiration_date.isoformat(),
+            "strike": strike_target,
+            "option_type": "Call",
+            "error": "The exact NVDA call contract was not found."
+        }), 404
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "error": f"NVDA option quote request failed: {exc}"
+        }), 502
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+# ==============================================================
+# ODTS QQQ 3-MIN INDICATORS TEST
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+def _odts_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _odts_ema(values, length):
+    if not values:
+        return None
+
+    alpha = 2.0 / (length + 1.0)
+    ema_value = float(values[0])
+
+    for value in values[1:]:
+        ema_value = (
+            alpha * float(value)
+            + (1.0 - alpha) * ema_value
+        )
+
+    return ema_value
+
+
+def _odts_wilder(values, length):
+    if len(values) < length:
+        return []
+
+    first = sum(values[:length]) / length
+    result = [None] * (length - 1) + [first]
+    previous = first
+
+    for value in values[length:]:
+        previous = (
+            (previous * (length - 1))
+            + value
+        ) / length
+        result.append(previous)
+
+    return result
+
+
+def _odts_adx(highs, lows, closes, length=14):
+    if len(closes) < (length * 2 + 1):
+        return None
+
+    tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+
+    for i in range(1, len(closes)):
+        high = highs[i]
+        low = lows[i]
+        prev_high = highs[i - 1]
+        prev_low = lows[i - 1]
+        prev_close = closes[i - 1]
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus_dm = (
+            up_move
+            if up_move > down_move and up_move > 0
+            else 0.0
+        )
+
+        minus_dm = (
+            down_move
+            if down_move > up_move and down_move > 0
+            else 0.0
+        )
+
+        tr_values.append(tr)
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    atr = _odts_wilder(tr_values, length)
+    plus_dm_smoothed = _odts_wilder(plus_dm_values, length)
+    minus_dm_smoothed = _odts_wilder(minus_dm_values, length)
+
+    dx_values = []
+
+
+    for i in range(len(tr_values)):
+        if (
+            i >= len(atr)
+            or atr[i] is None
+            or atr[i] == 0
+            or plus_dm_smoothed[i] is None
+            or minus_dm_smoothed[i] is None
+        ):
+            continue
+
+        plus_di = (
+            100.0
+            * plus_dm_smoothed[i]
+            / atr[i]
+        )
+
+        minus_di = (
+            100.0
+            * minus_dm_smoothed[i]
+            / atr[i]
+        )
+
+        denominator = plus_di + minus_di
+
+        if denominator == 0:
+            dx = 0.0
+        else:
+            dx = (
+                100.0
+                * abs(plus_di - minus_di)
+                / denominator
+            )
+
+        dx_values.append(dx)
+
+    if len(dx_values) < length:
+        return None
+
+    adx_series = _odts_wilder(dx_values, length)
+
+    valid = [
+        value
+        for value in adx_series
+        if value is not None
+    ]
+
+    if not valid:
+        return None
+
+    return valid[-1]
+
+
+@app.get("/odts-qqq-indicators-test")
+def odts_qqq_indicators_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    symbol = "QQQ"
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/barcharts/{symbol}"
+    )
+
+    params = {
+        "interval": "3",
+        "unit": "Minute",
+        "barsback": "260",
+        "sessiontemplate": "Default"
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params=params,
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                f"QQQ bar request failed: {exc}"
+            )
+        }), 502
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "status_code": response.status_code,
+            "response": response.text[:1000]
+        }), response.status_code
+
+    try:
+        body = response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                "TradeStation bar response "
+                "was not valid JSON."
+            )
+        }), 502
+
+    bars = (
+        body.get("Bars", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(bars, list) or not bars:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": "No QQQ bars were returned."
+        }), 502
+
+    bars = sorted(
+        bars,
+        key=lambda item: int(
+            item.get("Epoch", 0) or 0
+        )
+    )
+
+    closed_bars = []
+
+    for bar in bars:
+        status = str(
+            bar.get("BarStatus", "")
+        ).strip().lower()
+
+        if status and status != "closed":
+            continue
+
+        closed_bars.append(bar)
+
+    if len(closed_bars) < 50:
+        closed_bars = bars
+
+    highs = [
+        _odts_float(bar.get("High"))
+        for bar in closed_bars
+    ]
+
+    lows = [
+        _odts_float(bar.get("Low"))
+        for bar in closed_bars
+    ]
+
+    closes = [
+        _odts_float(bar.get("Close"))
+        for bar in closed_bars
+    ]
+
+    volumes = [
+        _odts_float(bar.get("TotalVolume"))
+        for bar in closed_bars
+    ]
+
+    if len(closes) < 25:
+        return jsonify({
+            "ok": False,
+
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": (
+                "Not enough completed 3-minute "
+                "bars were returned."
+            )
+        }), 502
+
+    ema21 = _odts_ema(closes, 21)
+
+    zlema_length = 5
+    lag = int((zlema_length - 1) / 2)
+
+    adjusted = []
+
+    for i, close_value in enumerate(closes):
+        if i < lag:
+            adjusted.append(close_value)
+        else:
+            adjusted.append(
+                close_value
+                + (
+                    close_value
+                    - closes[i - lag]
+                )
+            )
+
+    zlema_series = []
+    alpha = 2.0 / (zlema_length + 1.0)
+    running = adjusted[0]
+    zlema_series.append(running)
+
+    for value in adjusted[1:]:
+        running = (
+            alpha * value
+            + (1.0 - alpha) * running
+        )
+        zlema_series.append(running)
+
+    zlema_state = 0
+
+    if len(zlema_series) >= 2:
+        if zlema_series[-1] > zlema_series[-2]:
+            zlema_state = 1
+        elif zlema_series[-1] < zlema_series[-2]:
+            zlema_state = -1
+
+    confirm_bars = 0
+
+    if zlema_state != 0:
+        for i in range(
+            len(zlema_series) - 1,
+            0,
+            -1
+        ):
+            current_state = 0
+
+            if zlema_series[i] > zlema_series[i - 1]:
+                current_state = 1
+            elif zlema_series[i] < zlema_series[i - 1]:
+                current_state = -1
+
+            if current_state != zlema_state:
+                break
+
+            confirm_bars += 1
+
+            if confirm_bars >= 2:
+                break
+
+    adx14 = _odts_adx(
+        highs,
+        lows,
+        closes,
+        14
+    )
+
+    latest_bar = closed_bars[-1]
+    latest_timestamp = latest_bar.get(
+        "TimeStamp",
+        ""
+    )
+
+    latest_session_date = None
+
+    try:
+        latest_dt = datetime.fromisoformat(
+            latest_timestamp.replace(
+                "Z",
+                "+00:00"
+            )
+        ).astimezone(ET)
+
+        latest_session_date = latest_dt.date()
+    except Exception:
+        latest_session_date = None
+
+    session_pv = 0.0
+    session_volume = 0.0
+
+    for bar, high, low, close_value, volume in zip(
+        closed_bars,
+        highs,
+        lows,
+        closes,
+        volumes
+    ):
+        include_bar = True
+
+        if latest_session_date is not None:
+            try:
+                bar_dt = datetime.fromisoformat(
+                    str(
+                        bar.get(
+                            "TimeStamp",
+                            ""
+                        )
+                    ).replace(
+                        "Z",
+                        "+00:00"
+                    )
+                ).astimezone(ET)
+
+                include_bar = (
+                    bar_dt.date()
+                    == latest_session_date
+                )
+            except Exception:
+                include_bar = False
+
+        if not include_bar:
+            continue
+
+        typical_price = (
+            high
+            + low
+            + close_value
+        ) / 3.0
+
+        session_pv += (
+            typical_price
+            * volume
+        )
+
+        session_volume += volume
+
+    vwap = (
+        session_pv / session_volume
+        if session_volume > 0
+        else None
+    )
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "symbol": symbol,
+        "timeframe": "3 Minute",
+        "bar_timestamp": latest_timestamp,
+        "bars_used": len(closed_bars),
+        "qqq_close": round(closes[-1], 6),
+        "ema21": (
+            round(ema21, 6)
+            if ema21 is not None
+            else ""
+        ),
+        "vwap": (
+            round(vwap, 6)
+            if vwap is not None
+            else ""
+        ),
+        "zlema_state": zlema_state,
+        "zlema_confirm": confirm_bars,
+        "adx14": (
+            round(adx14, 6)
+            if adx14 is not None
+            else ""
+        )
+    })
+
+
+
+# ==============================================================
+# ODTS QQQ OPTION CONTRACT SELECTOR V1
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-option-test")
+def odts_option_test(direction_override=None):
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    # ----------------------------------------------------------
+    # ODTS V1 FROZEN SELECTION INPUTS
+    # ----------------------------------------------------------
+    underlying = "QQQ"
+    allowed_dte = [1, 2]
+    target_delta_min = 0.50
+    target_delta_max = 0.65
+    target_delta_mid = (
+        target_delta_min + target_delta_max
+    ) / 2.0
+
+    # Spread rule discussed for V1:
+    # <= 10% preferred, > 15% rejected.
+    preferred_spread_pct = 10.0
+    max_spread_pct = 15.0
+
+    # ODTS SIM V1 frozen risk/target controls.
+    # These are DISPLAY-ONLY in this revision. No option order can
+    # be submitted from this route.
+    quantity_contracts = 1
+    max_loss_pct = 35.0
+    profit_target_pct = 50.0
+
+    # Number of strikes above and below the underlying used by
+    # TradeStation's option-chain stream. 12 gives ample room
+    # around ATM for the 0.50-0.65 Delta target.
+    strike_proximity = 12
+
+    # Direction is intentionally READ ONLY and may be supplied as:
+    #   /odts-option-test?direction=BULLISH
+    #   /odts-option-test?direction=BEARISH
+    #   /odts-option-test?direction=BOTH
+    # Until the signal engine is connected, BOTH is the default.
+    direction = str(
+        direction_override
+        if direction_override is not None
+        else request.args.get("direction", "BOTH")
+    ).strip().upper()
+
+    if direction in {"CALL", "LONG_CALL"}:
+        direction = "BULLISH"
+    elif direction in {"PUT", "LONG_PUT"}:
+        direction = "BEARISH"
+
+    if direction not in {"BULLISH", "BEARISH", "BOTH"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "error": (
+                "direction must be BULLISH, BEARISH, or BOTH"
+            )
+        }), 400
+
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+
+        if not raw:
+            return None
+
+        # TradeStation expirations normally arrive as
+        # 2026-09-03T00:00:00Z. Keep a few safe fallbacks.
+        candidates = [
+            raw,
+            raw.replace("Z", "+00:00"),
+            raw[:10],
+        ]
+
+        for candidate in candidates:
+            try:
+                return datetime.fromisoformat(
+                    candidate
+                ).date()
+            except Exception:
+                pass
+
+        for fmt in (
+            "%m-%d-%Y",
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+        ):
+            try:
+                return datetime.strptime(
+                    raw[:10],
+                    fmt
+                ).date()
+            except Exception:
+                pass
+
+        return None
+
+    def candidate_from_chain(item, dte, expiration_date):
+        if not isinstance(item, dict):
+            return None
+
+        # Ignore stream-status and error messages.
+        if item.get("StreamStatus") or item.get("Error"):
+            return None
+
+        legs = item.get("Legs", [])
+        leg = (
+            legs[0]
+            if isinstance(legs, list)
+            and legs
+            and isinstance(legs[0], dict)
+            else {}
+        )
+
+        option_type = str(
+            item.get("Side")
+            or leg.get("OptionType")
+            or ""
+        ).strip().upper()
+
+        if option_type not in {"CALL", "PUT"}:
+            return None
+
+        delta_raw = safe_float(item.get("Delta"))
+
+        if delta_raw is None:
+            return None
+
+        abs_delta = abs(delta_raw)
+
+        if not (
+            target_delta_min
+            <= abs_delta
+            <= target_delta_max
+        ):
+            return None
+
+        bid = safe_float(item.get("Bid"))
+        ask = safe_float(item.get("Ask"))
+        last = safe_float(item.get("Last"))
+        mid = safe_float(item.get("Mid"))
+
+        if (
+            bid is None
+            or ask is None
+            or bid <= 0
+            or ask <= 0
+            or ask < bid
+        ):
+            return None
+
+
+        if mid is None or mid <= 0:
+            mid = (bid + ask) / 2.0
+
+        spread = ask - bid
+        spread_pct = (
+            (spread / mid) * 100.0
+            if mid > 0
+            else None
+        )
+
+        if (
+            spread_pct is None
+            or spread_pct > max_spread_pct
+        ):
+            return None
+
+        symbol = str(
+            leg.get("Symbol")
+            or item.get("Symbol")
+            or ""
+        ).strip()
+
+        strike = safe_float(
+            leg.get("StrikePrice")
+        )
+
+        if strike is None:
+            strikes = item.get("Strikes", [])
+            if isinstance(strikes, list) and strikes:
+                strike = safe_float(strikes[0])
+
+        open_interest = safe_int(
+            item.get("DailyOpenInterest"),
+            0
+        )
+        volume = safe_int(
+            item.get("Volume"),
+            0
+        )
+
+        # No hard OI/volume cutoff yet. We use both as ranking
+        # preferences so V1 does not invent an unapproved rule.
+        # Lower score is better.
+        delta_distance = abs(
+            abs_delta - target_delta_mid
+        )
+
+        spread_penalty = spread_pct / 100.0
+        oi_bonus = min(open_interest, 5000) / 500000.0
+        volume_bonus = min(volume, 5000) / 1000000.0
+
+        score = (
+            delta_distance
+            + spread_penalty
+            - oi_bonus
+            - volume_bonus
+        )
+
+        spread_status = (
+            "PREFERRED"
+            if spread_pct <= preferred_spread_pct
+            else "ACCEPTABLE"
+        )
+
+        gross_cost = ask * 100.0 * quantity_contracts
+        planned_exit_price = ask * (1.0 - max_loss_pct / 100.0)
+        planned_target_price = ask * (1.0 + profit_target_pct / 100.0)
+        planned_risk_dollars = gross_cost * (max_loss_pct / 100.0)
+        planned_profit_dollars = gross_cost * (profit_target_pct / 100.0)
+        reward_risk = (
+            planned_profit_dollars / planned_risk_dollars
+            if planned_risk_dollars > 0
+            else None
+        )
+
+        return {
+            "symbol": symbol,
+            "option_type": option_type.title(),
+            "expiration": expiration_date.isoformat(),
+            "dte": dte,
+            "strike": (
+                round(strike, 4)
+                if strike is not None
+                else ""
+            ),
+            "delta": round(delta_raw, 6),
+            "abs_delta": round(abs_delta, 6),
+            "bid": round(bid, 4),
+            "ask": round(ask, 4),
+            "mid": round(mid, 4),
+            "last": (
+                round(last, 4)
+                if last is not None
+                else ""
+            ),
+            "spread": round(spread, 4),
+            "spread_pct": round(spread_pct, 4),
+            "spread_status": spread_status,
+            "volume": volume,
+            "open_interest": open_interest,
+            "gamma": item.get("Gamma", ""),
+            "theta": item.get("Theta", ""),
+            "vega": item.get("Vega", ""),
+            "implied_volatility": item.get(
+                "ImpliedVolatility",
+                ""
+            ),
+            "probability_itm": item.get(
+                "ProbabilityITM",
+                ""
+            ),
+            "probability_otm": item.get(
+                "ProbabilityOTM",
+                ""
+            ),
+            "quantity_contracts": quantity_contracts,
+            "gross_premium_cost": round(gross_cost, 2),
+            "absolute_worst_case_loss": round(gross_cost, 2),
+            "max_loss_pct": max_loss_pct,
+            "planned_exit_option_price": round(planned_exit_price, 4),
+            "planned_risk_dollars": round(planned_risk_dollars, 2),
+            "profit_target_pct": profit_target_pct,
+            "planned_target_option_price": round(planned_target_price, 4),
+            "planned_profit_dollars": round(planned_profit_dollars, 2),
+            "reward_risk": (
+                round(reward_risk, 4)
+                if reward_risk is not None
+                else ""
+            ),
+            "score": round(score, 8),
+        }
+
+    # ----------------------------------------------------------
+    # 1) GET AVAILABLE QQQ EXPIRATIONS
+    # ----------------------------------------------------------
+    expiration_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/options/expirations/{underlying}"
+    )
+
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "error": (
+                f"QQQ expiration request failed: {exc}"
+            )
+        }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000]
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "error": (
+                "TradeStation expiration response was not valid JSON."
+            )
+        }), 502
+
+
+    expirations = (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    )
+
+    today_et = now_et().date()
+    eligible_expirations = []
+
+    for expiration_item in expirations:
+        if not isinstance(expiration_item, dict):
+            continue
+
+        expiration_date = parse_expiration(
+            expiration_item.get("Date")
+        )
+
+        if expiration_date is None:
+            continue
+
+        dte = (
+            expiration_date - today_et
+        ).days
+
+        expiration_type = str(
+            expiration_item.get("Type", "")
+        ).strip()
+
+        # Accept every listed QQQ expiration at 1-2 calendar DTE.
+        # This includes regular Monthly and Weekly expirations.  The
+        # frozen allowed_dte list continues to exclude 0 DTE.
+        if dte in allowed_dte:
+            eligible_expirations.append({
+                "date": expiration_date,
+                "dte": dte,
+                "type": expiration_type,
+            })
+
+    eligible_expirations.sort(
+        key=lambda item: (
+            item["dte"],
+            item["date"]
+        )
+    )
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "underlying": underlying,
+            "allowed_dte": allowed_dte,
+            "expiration_type": "Monthly or Weekly",
+            "error": (
+                "No QQQ Monthly or Weekly expiration was found at exactly "
+                "1 or 2 calendar DTE."
+            )
+        }), 404
+
+    # ----------------------------------------------------------
+    # 2) STREAM INITIAL CHAIN SNAPSHOT FOR EACH 1-2 DTE EXPIRY
+    # ----------------------------------------------------------
+    all_candidates = []
+    stream_notes = []
+
+    chain_url = (
+        f"{TS_API_BASE_URL}"
+        f"/marketdata/stream/options/chains/{underlying}"
+    )
+
+    for expiry in eligible_expirations:
+        expiration_date = expiry["date"]
+        expiration_param = expiration_date.strftime(
+            "%m-%d-%Y"
+        )
+
+        chain_params = {
+            "expiration": expiration_param,
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "All",
+        }
+
+        chain_response = None
+        message_count = 0
+        candidate_count = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(5, 4)
+            )
+
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500]
+                })
+                chain_response.close()
+                continue
+
+            # For Single + All with strikeProximity=12, an initial
+            # snapshot is normally about 50 contracts (25 strikes x
+            # Call/Put). We stop after 60 messages so this HTTP route
+            # never becomes a permanent streaming connection.
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+
+                text = line.decode(
+                    "utf-8",
+                    errors="replace"
+                ).strip()
+
+                if not text:
+                    continue
+
+                try:
+                    item = json.loads(text)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") == "EndSnapshot":
+                    break
+
+                if item.get("StreamStatus") == "GoAway":
+                    break
+
+                message_count += 1
+
+                candidate = candidate_from_chain(
+                    item,
+                    expiry["dte"],
+                    expiration_date
+                )
+
+                if candidate is not None:
+                    all_candidates.append(candidate)
+                    candidate_count += 1
+
+                if message_count >= 60:
+                    break
+
+        except requests.RequestException as exc:
+            # If the stream times out after its initial burst, keep
+            # any candidates already collected and report the note.
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": candidate_count > 0,
+                "message_count": message_count,
+                "candidate_count": candidate_count,
+                "note": str(exc)[:300]
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration")
+            == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+                "candidate_count": candidate_count,
+
+            })
+
+    calls = [
+        item
+        for item in all_candidates
+        if item["option_type"] == "Call"
+    ]
+
+    puts = [
+        item
+        for item in all_candidates
+        if item["option_type"] == "Put"
+    ]
+
+    calls.sort(key=lambda item: item["score"])
+    puts.sort(key=lambda item: item["score"])
+
+    best_call = calls[0] if calls else None
+    best_put = puts[0] if puts else None
+
+    selected = None
+
+    if direction == "BULLISH":
+        selected = best_call
+    elif direction == "BEARISH":
+        selected = best_put
+
+    if direction == "BULLISH" and best_call is None:
+        selection_status = "NO QUALIFIED CALL"
+    elif direction == "BEARISH" and best_put is None:
+        selection_status = "NO QUALIFIED PUT"
+    elif direction == "BOTH":
+        selection_status = (
+            "REFERENCE ONLY - BOTH SIDES RETURNED"
+        )
+    else:
+        selection_status = "QUALIFIED CONTRACT FOUND"
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "underlying": underlying,
+        "direction": direction,
+        "selection_status": selection_status,
+        "rules": {
+            "expiration_type": "Monthly or Weekly",
+            "allowed_dte": allowed_dte,
+            "target_abs_delta": [
+                target_delta_min,
+                target_delta_max
+            ],
+            "preferred_spread_pct_max": (
+                preferred_spread_pct
+            ),
+            "reject_spread_pct_above": max_spread_pct,
+            "liquidity_rule": (
+                "Open interest and volume are ranking preferences; "
+                "no hard cutoff is enabled in V1."
+            ),
+            "quantity_contracts": quantity_contracts,
+            "max_loss_pct": max_loss_pct,
+            "profit_target_pct": profit_target_pct,
+            "exit_rule": (
+                "EXIT WHEN -35% MAX LOSS OR +50% PROFIT TARGET "
+                "IS REACHED, WHICHEVER OCCURS FIRST"
+            ),
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "qualified_candidate_count": len(all_candidates),
+        "best_call": best_call,
+        "best_put": best_put,
+        "selected_contract": selected,
+        "stream_notes": stream_notes,
+        "risk_gate": {
+            "quantity_contracts": quantity_contracts,
+            "entry_reference": "LIVE ASK",
+            "max_loss_pct": max_loss_pct,
+            "profit_target_pct": profit_target_pct,
+            "reward_risk": round(profit_target_pct / max_loss_pct, 4),
+            "exit_rule": (
+                "WHICHEVER OCCURS FIRST: -35% PREMIUM LOSS OR "
+                "+50% PREMIUM GAIN"
+            ),
+            "approval": "DISABLED",
+            "order_capability": "DISABLED - READ ONLY"
+        },
+        "next_step": (
+            "Verify selector output against OptionStation Pro. "
+            "No option order can be sent from this route."
+        )
+    })
+
+
+
+# ==============================================================
+# ODTS QQQ UNIFIED CONTROL STATUS V1
+# READ ONLY / AUTO DIRECTION -> CALL OR PUT CANDIDATE
+# ============================================================== 
+
+def _odts_indicator_snapshot():
+    """Return the verified QQQ 3-minute indicator route as a dict."""
+    # Call the verified route function directly. Avoid Flask's
+    # test_request_context at runtime because flask.testing can trigger
+    # an import-cycle failure under the deployed Python/Flask stack.
+    response = odts_qqq_indicators_test()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS indicator route did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+@app.get("/odts-control-status")
+def odts_control_status():
+    """
+    One READ-ONLY Excel-friendly ODTS snapshot.
+
+    Direction is determined automatically from the current verified
+    3-minute QQQ ZLEMA state:
+        +1 -> BULLISH -> CALL selector
+        -1 -> BEARISH -> PUT selector
+         0 -> NEUTRAL -> no option selection
+
+    This route NEVER submits an order and does not alter SOXL logic.
+    """
+    indicators_ok, indicators = _odts_indicator_snapshot()
+
+    if not indicators_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "environment": "SIM",
+            "error": indicators.get(
+                "error",
+                "Unable to read QQQ indicators."
+            ),
+            "next_step": indicators.get("next_step", "Open /login"),
+        }), int(indicators.get("status_code", 502) or 502)
+
+    zlema_state = int(indicators.get("zlema_state", 0) or 0)
+    zlema_confirm = int(indicators.get("zlema_confirm", 0) or 0)
+    qqq_close = _odts_float(indicators.get("qqq_close"))
+    vwap = _odts_float(indicators.get("vwap"))
+    ema21 = _odts_float(indicators.get("ema21"))
+    adx14 = _odts_float(indicators.get("adx14"))
+
+    if zlema_state > 0:
+        direction = "BULLISH"
+        option_side = "CALL"
+    elif zlema_state < 0:
+
+        direction = "BEARISH"
+        option_side = "PUT"
+    else:
+        direction = "NEUTRAL"
+        option_side = ""
+
+    trend_alignment = "WAIT"
+    if (
+        direction == "BULLISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close > vwap
+        and qqq_close > ema21
+    ):
+        trend_alignment = "YES"
+    elif (
+        direction == "BEARISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close < vwap
+        and qqq_close < ema21
+    ):
+        trend_alignment = "YES"
+
+    zlema_gate = "YES" if zlema_confirm >= 2 else "WAIT"
+
+    if adx14 is not None and adx14 >= 20.0:
+        adx_gate = "YES"
+    elif adx14 is not None and adx14 >= 15.0:
+        adx_gate = "CAUTION"
+    else:
+        adx_gate = "WAIT"
+
+    selected = None
+    selector_error = ""
+
+    if direction in {"BULLISH", "BEARISH"}:
+        selector_ok, selector_result = _odts_selector_snapshot(direction)
+        if selector_ok:
+            selected = selector_result
+        else:
+            selector_error = str(
+                selector_result.get(
+                    "error",
+                    "No qualified option contract is available."
+                )
+            )
+
+    contract_gate = "WAIT"
+    risk_gate = "WAIT"
+
+    if isinstance(selected, dict):
+        dte = int(selected.get("dte", 0) or 0)
+        abs_delta = _odts_float(selected.get("abs_delta"))
+        spread_pct = _odts_float(selected.get("spread_pct"))
+
+        contract_qualified = (
+            dte in {1, 2}
+            and abs_delta is not None
+            and 0.50 <= abs_delta <= 0.65
+            and spread_pct is not None
+            and spread_pct <= 15.0
+        )
+
+        if contract_qualified:
+            contract_gate = "YES"
+            risk_gate = "YES"
+
+    # This is intentionally a conservative pre-approval decision.
+    # Human APPROVE/PASS remains required for entry; this route itself
+    # is strictly read-only.
+    setup_ready = (
+        direction in {"BULLISH", "BEARISH"}
+        and trend_alignment == "YES"
+        and zlema_gate == "YES"
+        and adx_gate in {"YES", "CAUTION"}
+        and contract_gate == "YES"
+        and risk_gate == "YES"
+    )
+
+    if setup_ready:
+        decision = option_side
+        approval_status = "READY FOR PROPOSAL"
+    else:
+        decision = "WAIT"
+        approval_status = "WAIT"
+
+    def sval(key, default=""):
+        if not isinstance(selected, dict):
+            return default
+        value = selected.get(key, default)
+        return default if value is None else value
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "environment": "SIM",
+        "symbol": "QQQ",
+        "timeframe": indicators.get("timeframe", "3 Minute"),
+        "bar_timestamp": indicators.get("bar_timestamp", ""),
+
+        # Automatic direction / decision
+        "direction": direction,
+        "option_side": option_side,
+        "decision": decision,
+        "approval_status": approval_status,
+
+        # QQQ live indicators
+        "qqq_close": indicators.get("qqq_close", ""),
+        "zlema_state": zlema_state,
+        "zlema_confirm": zlema_confirm,
+        "adx14": indicators.get("adx14", ""),
+        "vwap": indicators.get("vwap", ""),
+        "ema21": indicators.get("ema21", ""),
+
+        # Gate status
+        "trend_alignment_gate": trend_alignment,
+        "zlema_confirmation_gate": zlema_gate,
+        "adx_gate": adx_gate,
+        "contract_gate": contract_gate,
+        "risk_gate": risk_gate,
+
+        # Current automatically selected contract
+        "option_symbol": sval("symbol"),
+        "option_type": sval("option_type"),
+        "expiration": sval("expiration"),
+        "dte": sval("dte"),
+        "strike": sval("strike"),
+        "bid": sval("bid"),
+        "ask": sval("ask"),
+        "mid": sval("mid"),
+        "spread_pct": sval("spread_pct"),
+        "abs_delta": sval("abs_delta"),
+        "volume": sval("volume"),
+        "open_interest": sval("open_interest"),
+        "implied_volatility": sval("implied_volatility"),
+
+        # Frozen 1-contract risk / reward fields
+        "quantity_contracts": sval("quantity_contracts", 1),
+        "contract_cost_dollars": sval("gross_premium_cost"),
+        "max_loss_pct": sval("max_loss_pct", 35.0),
+        "planned_risk_dollars": sval("planned_risk_dollars"),
+        "stop_option_price": sval("planned_exit_option_price"),
+        "profit_target_pct": sval("profit_target_pct", 50.0),
+        "planned_profit_dollars": sval("planned_profit_dollars"),
+        "target_option_price": sval("planned_target_option_price"),
+        "reward_risk": sval("reward_risk", 1.4286),
+
+        "selector_error": selector_error,
+        "safety": (
+            "READ ONLY. Automatic direction and contract selection only. "
+            "Human APPROVE/PASS is still required. SOXL order functions "
+            "are not used by this endpoint."
+        ),
+    })
+
+
+# ==============================================================
+# ODTS QQQ APPROVAL-READY EMAIL ALERT V1
+# NOTIFICATION ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+def _odts_email_config_ok():
+    return bool(
+        ODTS_EMAIL_SENDER
+        and ODTS_EMAIL_RECIPIENT
+        and ODTS_EMAIL_APP_PASSWORD
+    )
+
+
+def _odts_email_state_update(**kwargs):
+    with odts_email_lock:
+        odts_email_state.update(kwargs)
+
+
+def _odts_email_state_snapshot():
+    with odts_email_lock:
+
+        return dict(odts_email_state)
+
+
+def _odts_control_snapshot_for_email():
+    """Call the existing READ-ONLY unified control route and return a dict."""
+    # Background email worker: use only an application context.
+    # This avoids importing flask.testing / EnvironBuilder at runtime.
+    with app.app_context():
+        response = odts_control_status()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS control-status route did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+def _odts_setup_is_approval_ready(snapshot):
+    if not isinstance(snapshot, dict):
+        return False
+
+    decision = str(snapshot.get("decision") or "").strip().upper()
+    risk_gate = str(snapshot.get("risk_gate") or "").strip().upper()
+    contract_gate = str(snapshot.get("contract_gate") or "").strip().upper()
+    option_symbol = str(snapshot.get("option_symbol") or "").strip()
+
+    return bool(
+        decision in {"CALL", "PUT"}
+        and risk_gate == "YES"
+        and contract_gate == "YES"
+        and option_symbol.upper().startswith("QQQ")
+    )
+
+
+def _odts_send_email(subject, body):
+    """Send one Gmail SMTP message. Notification only; no trading side effects."""
+    if not _odts_email_config_ok():
+        return False, "Email configuration is incomplete in Render."
+
+    message = EmailMessage()
+    message["From"] = ODTS_EMAIL_SENDER
+    message["To"] = ODTS_EMAIL_RECIPIENT
+    message["Subject"] = subject
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            timeout=20
+        ) as smtp:
+            smtp.login(
+                ODTS_EMAIL_SENDER,
+                ODTS_EMAIL_APP_PASSWORD
+            )
+            smtp.send_message(message)
+    except Exception as exc:
+        log.exception("ODTS EMAIL SEND FAILED | %s", exc)
+        return False, str(exc)
+
+    return True, "Email sent."
+
+
+def _odts_build_approval_email(snapshot):
+    direction = str(snapshot.get("direction") or "").upper()
+    decision = str(snapshot.get("decision") or "").upper()
+    option_symbol = str(snapshot.get("option_symbol") or "")
+    qqq_close = snapshot.get("qqq_close", "")
+    dte = snapshot.get("dte", "")
+    strike = snapshot.get("strike", "")
+    bid = snapshot.get("bid", "")
+    ask = snapshot.get("ask", "")
+    delta = snapshot.get("abs_delta", "")
+    cost = snapshot.get("contract_cost_dollars", "")
+    risk = snapshot.get("planned_risk_dollars", "")
+    stop = snapshot.get("stop_option_price", "")
+    target = snapshot.get("target_option_price", "")
+    rr = snapshot.get("reward_risk", "")
+
+    subject = f"ODTS QQQ APPROVAL REQUIRED - {decision}"
+    proposal_url = (
+        "https://zerolag-autotrader-v.onrender.com/"
+        f"odts-approval-test?direction={direction}"
+    )
+
+    body = f"""ODTS QQQ setup is READY FOR YOUR APPROVAL.
+
+Decision: {decision}
+Direction: {direction}
+QQQ Price: {qqq_close}
+Option: {option_symbol}
+DTE: {dte}
+Strike: {strike}
+Bid / Ask: {bid} / {ask}
+Absolute Delta: {delta}
+Contract Cost: ${cost}
+Planned Max Risk: ${risk}
+Stop Option Price: {stop}
+Target Option Price: {target}
+Reward/Risk: {rr}
+
+Risk Gate: YES
+Contract Gate: YES
+Quantity: 1 contract
+Environment: SIM
+
+Create/refresh proposal:
+{proposal_url}
+
+Human APPROVE/PASS is still required. This email itself does not place an order.
+"""
+    return subject, body
+
+
+def _odts_email_alert_worker():
+    _odts_email_state_update(running=True, last_status="STARTED")
+
+    while True:
+        try:
+            if ODTS_EMAIL_ALERT_ENABLED != "YES":
+                _odts_email_state_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EMAIL_ALERT_DISABLED",
+                    last_decision="WAIT",
+                    armed=True,
+                    last_error=None
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            if not _odts_email_config_ok():
+                _odts_email_state_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EMAIL_CONFIG_INCOMPLETE",
+                    last_decision="WAIT",
+                    armed=True,
+                    last_error=(
+                        "ODTS_EMAIL_SENDER, ODTS_EMAIL_RECIPIENT, and "
+                        "ODTS_EMAIL_APP_PASSWORD are all required."
+                    )
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            ok, snapshot = _odts_control_snapshot_for_email()
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            if not ok:
+                _odts_email_state_update(
+                    last_check_at=now_iso,
+                    last_status="CONTROL_STATUS_NOT_READY",
+                    last_decision="WAIT",
+                    last_error=str(snapshot.get("error") or snapshot)[:500]
+                )
+                time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+                continue
+
+            decision = str(snapshot.get("decision") or "WAIT").upper()
+            option_symbol = str(snapshot.get("option_symbol") or "").strip()
+            ready = _odts_setup_is_approval_ready(snapshot)
+            state = _odts_email_state_snapshot()
+
+
+            if not ready:
+                _odts_email_state_update(
+                    armed=True,
+                    last_check_at=now_iso,
+                    last_status="WAITING_FOR_APPROVAL_READY_SETUP",
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_error=None
+                )
+            elif state.get("armed"):
+                subject, body = _odts_build_approval_email(snapshot)
+                sent, detail = _odts_send_email(subject, body)
+
+                _odts_email_state_update(
+                    armed=not sent,
+                    last_check_at=now_iso,
+                    last_status=(
+                        "APPROVAL_EMAIL_SENT"
+                        if sent
+                        else "APPROVAL_EMAIL_FAILED"
+                    ),
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_email_sent_at=now_iso if sent else state.get("last_email_sent_at"),
+                    last_email_subject=subject if sent else state.get("last_email_subject"),
+                    last_error=None if sent else detail
+                )
+            else:
+                _odts_email_state_update(
+                    last_check_at=now_iso,
+                    last_status="READY_ALREADY_NOTIFIED",
+                    last_decision=decision,
+                    last_option_symbol=option_symbol or None,
+                    last_error=None
+                )
+
+            time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+
+        except Exception as exc:
+            log.exception("ODTS EMAIL ALERT WORKER ERROR | %s", exc)
+            _odts_email_state_update(
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="EMAIL_WORKER_ERROR",
+                last_error=str(exc)
+            )
+            time.sleep(ODTS_EMAIL_ALERT_INTERVAL_SECONDS)
+
+
+def start_odts_email_alert_worker():
+    with odts_email_lock:
+        if odts_email_state.get("thread_started"):
+            return False
+        odts_email_state["thread_started"] = True
+
+    threading.Thread(
+        target=_odts_email_alert_worker,
+        name="odts-email-alert",
+        daemon=True
+    ).start()
+    return True
+
+
+@app.get("/odts-email-alert-status")
+def odts_email_alert_status():
+    return jsonify({
+        "ok": True,
+        "notification_only": True,
+        "environment": "SIM",
+        "ODTS_EMAIL_ALERT_ENABLED": ODTS_EMAIL_ALERT_ENABLED,
+        "poll_interval_seconds": ODTS_EMAIL_ALERT_INTERVAL_SECONDS,
+        "sender_configured": bool(ODTS_EMAIL_SENDER),
+        "recipient_configured": bool(ODTS_EMAIL_RECIPIENT),
+        "app_password_configured": bool(ODTS_EMAIL_APP_PASSWORD),
+        "state": _odts_email_state_snapshot(),
+        "safety": (
+            "Email alert only. This route and worker never call any SOXL or "
+            "ODTS order-submission function."
+        ),
+    })
+
+
+@app.get("/odts-email-test")
+def odts_email_test():
+    """Send one explicit test email. Never evaluates or submits an order."""
+    if not _odts_email_config_ok():
+        return jsonify({
+            "ok": False,
+            "email_sent": False,
+            "notification_only": True,
+            "error": "Email configuration is incomplete in Render."
+        }), 503
+
+    subject = "ODTS QQQ EMAIL TEST - SIM"
+    body = (
+        "ODTS QQQ email alert test succeeded if you received this message.\n\n"
+        "This is a notification-only test. No TradeStation order was placed, "
+        "modified, cancelled, or closed.\n"
+    )
+    sent, detail = _odts_send_email(subject, body)
+
+    _odts_email_state_update(
+        last_check_at=datetime.now(timezone.utc).isoformat(),
+        last_status="TEST_EMAIL_SENT" if sent else "TEST_EMAIL_FAILED",
+        last_email_sent_at=(
+            datetime.now(timezone.utc).isoformat() if sent
+            else _odts_email_state_snapshot().get("last_email_sent_at")
+        ),
+        last_email_subject=(
+            subject if sent
+            else _odts_email_state_snapshot().get("last_email_subject")
+        ),
+        last_error=None if sent else detail
+    )
+
+    return jsonify({
+        "ok": bool(sent),
+        "email_sent": bool(sent),
+        "notification_only": True,
+        "recipient_configured": bool(ODTS_EMAIL_RECIPIENT),
+        "message": detail,
+        "safety": "No order function is called by this test endpoint."
+    }), (200 if sent else 502)
+
+
+@app.get("/odts-approval-email-test")
+def odts_approval_email_test():
+    """SAFE simulated approval-ready email test.
+
+    Creates a synthetic qualified QQQ option setup and sends the same approval
+    email format used by the live notification worker. This endpoint is
+    notification-only: it does not call TradeStation, create an approval
+    proposal, or call any SOXL/ODTS order-submission function.
+    """
+    if not _odts_email_config_ok():
+        return jsonify({
+            "ok": False,
+            "email_sent": False,
+            "notification_only": True,
+            "simulated_setup": True,
+            "error": "Email configuration is incomplete in Render.",
+            "safety": "No order function is called by this test endpoint."
+        }), 503
+
+    synthetic_snapshot = {
+        "direction": "BULLISH",
+        "decision": "CALL",
+        "risk_gate": "YES",
+        "contract_gate": "YES",
+        "option_symbol": "QQQ TEST CALL",
+        "qqq_close": "SIMULATED",
+        "dte": 1,
+        "strike": "SIMULATED",
+        "bid": "SIMULATED",
+        "ask": "SIMULATED",
+        "abs_delta": 0.575,
+        "contract_cost_dollars": "SIMULATED",
+        "planned_risk_dollars": "SIMULATED",
+        "stop_option_price": "SIMULATED",
+        "target_option_price": "SIMULATED",
+        "reward_risk": 1.4286,
+    }
+
+    subject, body = _odts_build_approval_email(synthetic_snapshot)
+    subject = "ODTS QQQ APPROVAL REQUIRED - TEST ONLY"
+    body = (
+        "SAFE SIMULATION - NO ORDER CAN BE SENT FROM THIS TEST.\n\n"
+        + body
+        + "\nThis message was generated by /odts-approval-email-test.\n"
+    )
+
+    sent, detail = _odts_send_email(subject, body)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    _odts_email_state_update(
+        last_check_at=now_iso,
+        last_status=(
+            "APPROVAL_TEST_EMAIL_SENT"
+            if sent else "APPROVAL_TEST_EMAIL_FAILED"
+        ),
+
+        last_email_sent_at=(
+            now_iso if sent
+            else _odts_email_state_snapshot().get("last_email_sent_at")
+        ),
+        last_email_subject=(
+            subject if sent
+            else _odts_email_state_snapshot().get("last_email_subject")
+        ),
+        last_error=None if sent else detail
+    )
+
+    return jsonify({
+        "ok": bool(sent),
+        "email_sent": bool(sent),
+        "notification_only": True,
+        "simulated_setup": True,
+        "decision": "CALL",
+        "risk_gate": "YES",
+        "contract_gate": "YES",
+        "message": detail,
+        "safety": (
+            "TEST ONLY. No TradeStation request, proposal creation, approval "
+            "decision, SOXL order function, or ODTS order function is called."
+        )
+    }), (200 if sent else 502)
+
+
+# ==============================================================
+# ODTS QQQ SIM APPROVE / PASS + 1-CONTRACT EXECUTION V1
+# COMPLETELY SEPARATE FROM SOXL ORDER FUNCTIONS
+# ==============================================================
+
+def _odts_selector_snapshot(direction):
+    """
+    Reuse the already-verified ODTS option selector and return its
+    selected contract as a plain dict. No order is placed here.
+    """
+    # Pass direction explicitly so no synthetic Flask test request is needed.
+    response = odts_option_test(direction_override=direction)
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "ODTS selector did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    selected = payload.get("selected_contract")
+    if not isinstance(selected, dict) or not selected.get("symbol"):
+        return False, {
+            "error": "No qualified ODTS option contract is available.",
+            "selector": payload,
+        }
+
+    return True, selected
+
+
+def _odts_new_proposal(direction, selected):
+    proposal_id = secrets.token_urlsafe(18)
+    now_ts = time.time()
+
+    proposal = {
+        "proposal_id": proposal_id,
+        "created_at": now_ts,
+        "expires_at": now_ts + ODTS_PROPOSAL_TTL_SECONDS,
+        "direction": direction,
+        "symbol": str(selected.get("symbol", "")).strip(),
+        "option_type": str(selected.get("option_type", "")).strip(),
+        "expiration": selected.get("expiration"),
+        "dte": selected.get("dte"),
+        "strike": selected.get("strike"),
+        "delta": selected.get("delta"),
+        "abs_delta": selected.get("abs_delta"),
+        "bid": selected.get("bid"),
+        "ask": selected.get("ask"),
+        "spread_pct": selected.get("spread_pct"),
+        "quantity_contracts": 1,
+        "gross_premium_cost": selected.get("gross_premium_cost"),
+        "max_loss_pct": 35.0,
+        "planned_exit_option_price": selected.get("planned_exit_option_price"),
+        "planned_risk_dollars": selected.get("planned_risk_dollars"),
+        "profit_target_pct": 50.0,
+        "planned_target_option_price": selected.get("planned_target_option_price"),
+        "planned_profit_dollars": selected.get("planned_profit_dollars"),
+        "reward_risk": selected.get("reward_risk"),
+        "used": False,
+    }
+
+    odts_proposals[proposal_id] = proposal
+
+    # Keep memory bounded.
+    cutoff = now_ts - 900
+    stale_ids = [
+        key for key, value in odts_proposals.items()
+        if value.get("created_at", 0) < cutoff
+    ]
+    for key in stale_ids:
+        odts_proposals.pop(key, None)
+
+    return proposal
+
+
+def submit_odts_sim_option_limit_order(
+    access_token,
+    option_symbol,
+    limit_price,
+    quantity=1,
+):
+    """
+    ODTS-only long option entry. This function cannot route to LIVE,
+    cannot trade SOXL, and cannot submit more than one contract.
+    """
+    if not odts_sim_environment_ok():
+        return False, {
+            "error": "Blocked: ODTS option orders require the TradeStation SIM API base URL."
+        }
+
+    if ODTS_SIM_TRADING_ENABLED != "YES":
+        return False, {
+            "error": "Blocked: ODTS_SIM_TRADING_ENABLED is not YES."
+        }
+
+    if not TS_SIM_ACCOUNT_ID:
+        return False, {
+            "error": "Blocked: TS_SIM_ACCOUNT_ID is missing."
+        }
+
+    if int(quantity) != 1:
+        return False, {
+            "error": "Blocked: ODTS V1 permits exactly 1 option contract."
+        }
+
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, {
+            "error": "Blocked: ODTS V1 permits QQQ option symbols only."
+        }
+
+    try:
+        limit_price = round(float(limit_price), 2)
+    except (TypeError, ValueError):
+        return False, {"error": "Blocked: invalid limit price."}
+
+    if limit_price <= 0:
+        return False, {"error": "Blocked: limit price must be positive."}
+
+    if not odts_sim_session_now():
+        return False, {
+            "error": "Blocked: ODTS SIM option entry is outside 09:30-16:00 ET."
+        }
+
+    url = f"{TS_API_BASE_URL}/orderexecution/orders"
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Limit",
+        "LimitPrice": str(limit_price),
+        "TradeAction": "BUYTOOPEN",
+        "TimeInForce": {"Duration": "DAY"},
+    }
+
+    try:
+        response = requests.post(
+
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, {
+            "error": f"ODTS SIM option order request failed: {exc}",
+            "submitted_order": order,
+        }
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, {
+            "status_code": response.status_code,
+            "response": body,
+            "submitted_order": order,
+        }
+
+    return True, {
+        "response": body,
+        "submitted_order": order,
+    }
+
+
+@app.get("/odts-approval-test")
+def odts_approval_test():
+    direction = str(request.args.get("direction", "")).strip().upper()
+
+    if direction not in {"BULLISH", "BEARISH"}:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "approval_enabled": False,
+            "error": "direction must be BULLISH or BEARISH",
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "approval_enabled": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    selector_ok, selected = _odts_selector_snapshot(direction)
+    if not selector_ok:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "approval_enabled": False,
+            "direction": direction,
+            "error": selected.get("error", "No qualified contract."),
+            "selector_detail": selected,
+        }), 409
+
+    proposal = _odts_new_proposal(direction, selected)
+    proposal_id = proposal["proposal_id"]
+
+    approval_enabled = bool(
+        proposal.get("symbol")
+        and float(proposal.get("ask") or 0) > 0
+        and float(proposal.get("spread_pct") or 999) <= 15.0
+        and 0.50 <= float(proposal.get("abs_delta") or 0) <= 0.65
+    )
+
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "direction": direction,
+        "approval_enabled": approval_enabled,
+        "order_sent": False,
+        "order_gate": {
+            "ODTS_SIM_TRADING_ENABLED": ODTS_SIM_TRADING_ENABLED,
+            "sim_api": odts_sim_environment_ok(),
+            "regular_session_now": odts_sim_session_now(),
+            "quantity_contracts": 1,
+            "trade_action": "BUYTOOPEN",
+            "order_type": "Limit",
+            "limit_reference": "Current Ask revalidated at APPROVE time",
+        },
+        "proposal": proposal,
+        "approve_action": (
+            f"/odts-approval-decision?proposal_id={proposal_id}&decision=APPROVE"
+        ),
+        "pass_action": (
+            f"/odts-approval-decision?proposal_id={proposal_id}&decision=PASS"
+        ),
+        "safety": (
+            "QQQ option execution is isolated from SOXL. APPROVE authorizes the "
+            "current qualified directional setup, not one frozen strike. At APPROVE "
+            "time the selector immediately chooses the current best qualified contract "
+            "and all SIM, session, DTE, option-type, Delta, spread and risk gates are "
+            "revalidated before any order can be submitted."
+        ),
+    })
+
+
+@app.route("/odts-approval-decision", methods=["GET", "POST"])
+def odts_approval_decision():
+    decision = str(request.values.get("decision", "")).strip().upper()
+    proposal_id = str(request.values.get("proposal_id", "")).strip()
+
+    if decision not in {"APPROVE", "PASS"}:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "error": "decision must be APPROVE or PASS",
+        }), 400
+
+    proposal = odts_proposals.get(proposal_id)
+    if not proposal:
+        return jsonify({
+            "ok": False,
+            "order_sent": False,
+            "error": "Proposal not found or expired. Generate a new approval proposal.",
+        }), 404
+
+    if decision == "PASS":
+        proposal["used"] = True
+        return jsonify({
+            "ok": True,
+            "environment": "SIM",
+            "direction": proposal.get("direction"),
+            "decision": "PASS",
+            "proposal_id": proposal_id,
+            "approval_recorded": False,
+            "order_sent": False,
+            "result": "PASSED - NO ORDER",
+            "safety": "No TradeStation order function was called.",
+        })
+
+    # From this point forward, all checks and submission are serialized.
+    with odts_order_lock:
+        now_ts = time.time()
+
+        if proposal.get("used"):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: this proposal has already been used.",
+            }), 409
+
+        if now_ts > float(proposal.get("expires_at", 0)):
+            proposal["used"] = True
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: approval proposal expired. Generate a fresh proposal.",
+            }), 409
+
+        if ODTS_SIM_TRADING_ENABLED != "YES":
+            return jsonify({
+                "ok": False,
+                "environment": "SIM",
+                "decision": "APPROVE",
+                "approval_recorded": True,
+                "order_sent": False,
+                "proposal_id": proposal_id,
+                "result": "APPROVED BUT ORDER BLOCKED",
+                "error": "ODTS_SIM_TRADING_ENABLED is not YES.",
+            }), 403
+
+        if not odts_sim_environment_ok():
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: TradeStation API base is not SIM.",
+            }), 403
+
+        if not odts_sim_session_now():
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+
+                "error": "Blocked: outside 09:30-16:00 ET regular session.",
+            }), 403
+
+        direction = proposal.get("direction")
+        selector_ok, current = _odts_selector_snapshot(direction)
+        if not selector_ok:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current selector revalidation failed.",
+                "detail": current,
+            }), 409
+
+        # APPROVE authorizes the directional setup, not one exact strike.
+        # The selector may legitimately move to another qualified strike/expiry
+        # between proposal creation and the user's approval. We therefore use
+        # the current selected contract, while revalidating every frozen gate.
+        current_symbol = str(current.get("symbol", "")).strip()
+        current_option_type = str(current.get("option_type", "")).strip().upper()
+
+        try:
+            approved_ask = float(proposal.get("ask"))
+            current_ask = float(current.get("ask"))
+            current_spread_pct = float(current.get("spread_pct"))
+            current_abs_delta = float(current.get("abs_delta"))
+            current_dte = int(current.get("dte"))
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: invalid live option quote during revalidation.",
+            }), 409
+
+        if not current_symbol.upper().startswith("QQQ"):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current selected contract is not a QQQ option.",
+                "current_symbol": current_symbol,
+            }), 409
+
+        expected_option_type = "CALL" if direction == "BULLISH" else "PUT"
+        if current_option_type != expected_option_type:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current option type does not match approved direction.",
+                "direction": direction,
+                "expected_option_type": expected_option_type,
+                "current_option_type": current_option_type,
+            }), 409
+
+        if current_dte not in {1, 2}:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current contract is not 1-2 DTE.",
+                "dte": current_dte,
+            }), 409
+
+        if current_ask <= 0:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current Ask is not valid.",
+                "current_ask": current_ask,
+            }), 409
+
+        if current_spread_pct > 15.0:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: live spread now exceeds 15%.",
+                "spread_pct": current_spread_pct,
+            }), 409
+
+        if not (0.50 <= current_abs_delta <= 0.65):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: live Delta moved outside 0.50-0.65.",
+                "abs_delta": current_abs_delta,
+            }), 409
+
+        # Risk/cost guard remains tied to what the user saw at proposal time.
+        # A different qualified strike is allowed, but not a >5% increase in
+        # premium cost versus the approved setup reference.
+        max_allowed_ask = approved_ask * (1.0 + ODTS_MAX_ASK_INCREASE_PCT / 100.0)
+        if current_ask > max_allowed_ask:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: current qualified contract costs more than 5% above the approved setup reference.",
+                "proposal_symbol": proposal.get("symbol"),
+                "current_symbol": current_symbol,
+                "approved_ask_reference": approved_ask,
+                "current_ask": current_ask,
+                "max_allowed_ask": round(max_allowed_ask, 4),
+            }), 409
+
+        if (
+            odts_last_order.get("symbol") == current_symbol
+            and now_ts - float(odts_last_order.get("time", 0))
+            < ODTS_DUPLICATE_WINDOW_SECONDS
+        ):
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": "Blocked: duplicate ODTS option order window is active.",
+            }), 409
+
+        access_token, error = get_valid_access_token()
+        if not access_token:
+            return jsonify({
+                "ok": False,
+                "order_sent": False,
+                "error": error,
+                "next_step": "Open /login",
+            }), 401
+
+        # Freeze this proposal immediately before the one allowed submit call.
+        proposal["used"] = True
+        ok, order_result = submit_odts_sim_option_limit_order(
+            access_token=access_token,
+            option_symbol=current_symbol,
+            limit_price=current_ask,
+            quantity=1,
+        )
+
+        if not ok:
+            return jsonify({
+                "ok": False,
+                "environment": "SIM",
+                "decision": "APPROVE",
+                "approval_recorded": True,
+                "order_sent": False,
+                "proposal_id": proposal_id,
+                "error": "TradeStation SIM option order was not accepted.",
+                "detail": order_result,
+            }), 502
+
+        # Preserve the submitted order identity for later fill capture.
+        order_id = None
+        try:
+            orders = (order_result.get("response") or {}).get("Orders", [])
+            if isinstance(orders, list) and orders:
+                order_id = str(orders[0].get("OrderID") or "").strip() or None
+        except Exception:
+            order_id = None
+
+        odts_last_order["proposal_id"] = proposal_id
+        odts_last_order["symbol"] = current_symbol
+        odts_last_order["order_id"] = order_id
+        odts_last_order["limit_price"] = round(current_ask, 2)
+        odts_last_order["time"] = time.time()
+
+        return jsonify({
+            "ok": True,
+            "environment": "SIM",
+            "direction": direction,
+            "decision": "APPROVE",
+            "approval_recorded": True,
+            "order_sent": True,
+            "proposal_id": proposal_id,
+            "proposal_contract": proposal.get("symbol"),
+            "selected_contract": current_symbol,
+            "contract_changed_since_proposal": current_symbol != proposal.get("symbol"),
+            "quantity_contracts": 1,
+            "trade_action": "BUYTOOPEN",
+            "order_type": "Limit",
+            "limit_price": round(current_ask, 2),
+            "max_loss_pct": 35.0,
+            "profit_target_pct": 50.0,
+            "result": "ODTS QQQ 1-CONTRACT SIM ORDER SUBMITTED",
+            "tradestation": order_result,
+            "safety": "SOXL order functions were not used.",
+        })
+
+
+# ==============================================================
+
+# ODTS QQQ FILL CAPTURE / POSITION MONITOR - READ ONLY V1
+# ==============================================================
+
+def get_odts_sim_option_position(access_token, option_symbol):
+    """Read one exact QQQ option position from the TradeStation SIM account.
+
+    This function is READ ONLY. It never submits, replaces, or cancels an order.
+    TradeStation's Positions resource supplies AveragePrice, Quantity and Symbol;
+    AveragePrice is used as the authoritative filled-position entry reference.
+    """
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, None, {"error": "ODTS fill capture permits QQQ option symbols only."}
+
+    if not odts_sim_environment_ok():
+        return False, None, {"error": "ODTS fill capture requires the SIM API base URL."}
+
+    if not TS_SIM_ACCOUNT_ID:
+        return False, None, {"error": "TS_SIM_ACCOUNT_ID is missing."}
+
+    url = f"{TS_API_BASE_URL}/brokerage/accounts/{TS_SIM_ACCOUNT_ID}/positions"
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params={"symbol": option_symbol},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, None, {"error": f"ODTS position request failed: {exc}"}
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, None, {"status_code": response.status_code, "response": body}
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        positions = []
+
+    target = option_symbol.upper()
+    for position in positions:
+        symbol = str(position.get("Symbol") or "").strip().upper()
+        if symbol != target:
+            continue
+
+        try:
+            qty = float(position.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            avg_price = float(position.get("AveragePrice") or 0)
+        except (TypeError, ValueError):
+            avg_price = 0.0
+
+        normalized = {
+            "account_id": position.get("AccountID"),
+            "position_id": position.get("PositionID"),
+            "symbol": position.get("Symbol"),
+            "asset_type": position.get("AssetType"),
+            "long_short": position.get("LongShort"),
+            "quantity": qty,
+            "average_price": avg_price,
+            "last": position.get("Last"),
+            "bid": position.get("Bid"),
+            "ask": position.get("Ask"),
+            "market_value": position.get("MarketValue"),
+            "unrealized_pl": position.get("UnrealizedProfitLoss"),
+            "unrealized_pl_pct": position.get("UnrealizedProfitLossPercent"),
+            "timestamp": position.get("Timestamp"),
+        }
+        return True, normalized, body
+
+    return True, None, body
+
+
+@app.get("/odts-fill-capture-test")
+def odts_fill_capture_test():
+    """READ-ONLY test of automatic fill/position capture.
+
+    Before the first SIM trade this should normally return WAITING_FOR_POSITION.
+    After a BUYTOOPEN fills, it captures TradeStation AveragePrice and computes
+    the actual -35% and +50% option-price levels from the fill.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "message": "No ODTS option symbol is stored yet. This is expected before the first SIM entry.",
+            "last_order": odts_last_order,
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "symbol": symbol,
+            "stored_order_id": odts_last_order.get("order_id"),
+            "stored_limit_price": odts_last_order.get("limit_price"),
+            "message": "No matching SIM position exists yet; no fill price has been captured.",
+        })
+
+    avg = float(position.get("average_price") or 0)
+    if avg <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "status": "POSITION_FOUND_FILL_PRICE_PENDING",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+    actual_cost = round(avg * 100.0, 2)
+    planned_risk = round(actual_cost * 0.35, 2)
+    planned_profit = round(actual_cost * 0.50, 2)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "status": "FILL_CAPTURED_FROM_SIM_POSITION",
+        "environment": "SIM",
+        "symbol": symbol,
+        "quantity_contracts": position.get("quantity"),
+        "actual_fill_price": avg,
+        "actual_contract_cost": actual_cost,
+        "max_loss_pct": 35.0,
+        "actual_stop_option_price": stop_price,
+        "planned_risk_dollars": planned_risk,
+        "profit_target_pct": 50.0,
+        "actual_target_option_price": target_price,
+        "planned_profit_dollars": planned_profit,
+        "reward_risk": round(50.0 / 35.0, 4),
+        "position": position,
+        "stored_order_id": odts_last_order.get("order_id"),
+        "safety": "READ ONLY. This endpoint cannot submit or close an order.",
+    })
+
+
+
+def submit_odts_sim_option_exit_order(access_token, option_symbol, quantity=1):
+    """ODTS-only long-option exit framework. SIM only, exactly 1 contract.
+
+    This function is hard-gated by ODTS_SIM_EXIT_ENABLED and is not called by
+    the dry-run monitor. It uses SELLTOCLOSE with a market order only after the
+    monitor has independently produced EXIT_STOP or EXIT_TARGET.
+    """
+    if not odts_sim_environment_ok():
+        return False, {"error": "Blocked: ODTS option exits require the TradeStation SIM API base URL."}
+    if ODTS_SIM_EXIT_ENABLED != "YES":
+
+        return False, {"error": "Blocked: ODTS_SIM_EXIT_ENABLED is not YES."}
+    if not TS_SIM_ACCOUNT_ID:
+        return False, {"error": "Blocked: TS_SIM_ACCOUNT_ID is missing."}
+    if int(quantity) != 1:
+        return False, {"error": "Blocked: ODTS V1 permits exactly 1 option contract."}
+    option_symbol = str(option_symbol or "").strip()
+    if not option_symbol.upper().startswith("QQQ"):
+        return False, {"error": "Blocked: ODTS V1 permits QQQ option symbols only."}
+    if not odts_sim_session_now():
+        return False, {"error": "Blocked: ODTS SIM option exit is outside 09:30-16:00 ET."}
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Market",
+        "TradeAction": "SELLTOCLOSE",
+        "TimeInForce": {"Duration": "DAY"},
+    }
+    try:
+        response = requests.post(
+            f"{TS_API_BASE_URL}/orderexecution/orders",
+            headers=ts_headers(access_token), json=order, timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, {"error": f"ODTS SIM exit request failed: {exc}", "submitted_order": order}
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+    if not response.ok:
+        return False, {"status_code": response.status_code, "response": body, "submitted_order": order}
+    return True, {"response": body, "submitted_order": order}
+
+
+@app.get("/odts-exit-framework-test")
+def odts_exit_framework_test():
+    """Safety/status test only. Never submits an exit order."""
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "quantity_contracts": 1,
+        "trade_action": "SELLTOCLOSE",
+        "order_type": "Market",
+        "trigger_source": "EXIT_STOP or EXIT_TARGET from ODTS monitor",
+        "exit_order_sent": False,
+        "read_only_test": True,
+        "safety": "Framework loaded. This test endpoint never calls the exit-order function.",
+    })
+
+
+# ==============================================================
+# ODTS QQQ EXIT TRIGGER SIMULATOR - READ ONLY V1
+# ==============================================================
+
+@app.get("/odts-exit-trigger-sim-test")
+def odts_exit_trigger_sim_test():
+    """READ-ONLY STOP/TARGET trigger simulator.
+
+    Uses the real SIM position AveragePrice only as a reference, then substitutes
+    a synthetic BID just beyond the selected threshold. It NEVER calls the
+    SELLTOCLOSE function and therefore cannot submit, replace, cancel, or close
+    an order regardless of ODTS_SIM_EXIT_ENABLED.
+
+    Examples:
+      /odts-exit-trigger-sim-test?case=STOP
+      /odts-exit-trigger-sim-test?case=TARGET
+    """
+    case = str(request.args.get("case") or "").strip().upper()
+    if case not in ("STOP", "TARGET"):
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "error": "case must be STOP or TARGET",
+            "examples": [
+                "/odts-exit-trigger-sim-test?case=STOP",
+                "/odts-exit-trigger-sim-test?case=TARGET",
+            ],
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "decision": "WAIT",
+            "message": "No ODTS option symbol is stored yet.",
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "decision": "WAIT",
+            "symbol": symbol,
+        })
+
+    try:
+        avg = float(position.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    try:
+        qty = float(position.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+
+    if avg <= 0 or qty <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only_test": True,
+            "exit_order_sent": False,
+            "status": "POSITION_DATA_NOT_READY",
+            "decision": "WAIT",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+
+    # Deliberately place the synthetic BID one cent beyond the selected trigger.
+    if case == "STOP":
+        simulated_bid = max(0.01, round(stop_price - 0.01, 2))
+    else:
+        simulated_bid = round(target_price + 0.01, 2)
+
+    if simulated_bid <= stop_price:
+        decision = "EXIT_STOP"
+        reason = "Simulated BID is at or below the -35% stop level."
+    elif simulated_bid >= target_price:
+        decision = "EXIT_TARGET"
+        reason = "Simulated BID is at or above the +50% target level."
+    else:
+        decision = "HOLD"
+        reason = "Simulated BID remains between the stop and target levels."
+
+    pnl_pct = round(((simulated_bid / avg) - 1.0) * 100.0, 2)
+    pnl_dollars = round((simulated_bid - avg) * 100.0 * qty, 2)
+
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "read_only_test": True,
+        "simulation_case": case,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "symbol": symbol,
+        "quantity_contracts": qty,
+        "actual_fill_price_reference": avg,
+        "real_current_bid_ignored": position.get("bid"),
+        "simulated_bid": simulated_bid,
+        "stop_option_price": stop_price,
+        "target_option_price": target_price,
+        "max_loss_pct": 35.0,
+        "profit_target_pct": 50.0,
+        "decision": decision,
+
+        "reason": reason,
+        "simulated_unrealized_pct": pnl_pct,
+        "simulated_unrealized_dollars": pnl_dollars,
+        "planned_exit_action": "SELLTOCLOSE",
+        "would_trigger_exit_framework": decision in ("EXIT_STOP", "EXIT_TARGET"),
+        "exit_framework_called": False,
+        "exit_order_sent": False,
+        "safety": "SIMULATION ONLY. This endpoint never calls the exit-order function and cannot close the real position.",
+    })
+
+
+# ==============================================================
+# ODTS QQQ POSITION MONITOR / EXIT DECISION - READ ONLY V1
+# ==============================================================
+
+@app.get("/odts-position-monitor-test")
+def odts_position_monitor_test():
+    """READ-ONLY ODTS position monitor and exit-decision test.
+
+    Uses the authoritative SIM position AveragePrice as the fill reference.
+    For a long option, the current BID is used as the conservative executable
+    exit reference. The endpoint returns HOLD, EXIT_STOP, or EXIT_TARGET.
+    When an EXIT_* decision occurs, it passes the request to the separate ODTS
+    SIM exit function. That function remains hard-gated by ODTS_SIM_EXIT_ENABLED.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "exit_order_sent": False,
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    symbol = str(request.args.get("symbol") or odts_last_order.get("symbol") or "").strip()
+    if not symbol:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "NO_ODTS_ORDER_YET",
+            "decision": "WAIT",
+            "message": "No ODTS option symbol is stored yet. This is expected before the first SIM entry.",
+        })
+
+    ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "exit_order_sent": False,
+            "symbol": symbol,
+            "error": detail,
+        }), 502
+
+    if not position:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "WAITING_FOR_POSITION",
+            "decision": "WAIT",
+            "symbol": symbol,
+            "message": "No matching SIM position exists yet; monitoring will begin after the BUYTOOPEN fill appears.",
+        })
+
+    try:
+        avg = float(position.get("average_price") or 0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    try:
+        qty = float(position.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        bid = float(position.get("bid") or 0)
+    except (TypeError, ValueError):
+        bid = 0.0
+    try:
+        last = float(position.get("last") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+
+    if avg <= 0 or qty <= 0:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "exit_order_sent": False,
+            "status": "POSITION_DATA_NOT_READY",
+            "decision": "WAIT",
+            "position": position,
+        })
+
+    stop_price = round(avg * 0.65, 2)
+    target_price = round(avg * 1.50, 2)
+
+    # A long option is sold to exit, so BID is the conservative executable
+    # reference. LAST is reported for information only and is not the trigger.
+    current_exit_reference = bid if bid > 0 else None
+
+    if current_exit_reference is None:
+        decision = "WAIT"
+        reason = "No valid BID is available; exit decision is intentionally withheld."
+        status = "PRICE_NOT_READY"
+        pnl_pct = None
+        pnl_dollars = None
+    else:
+        pnl_pct = round(((current_exit_reference / avg) - 1.0) * 100.0, 2)
+        pnl_dollars = round((current_exit_reference - avg) * 100.0 * qty, 2)
+        if current_exit_reference <= stop_price:
+            decision = "EXIT_STOP"
+            reason = "Current BID is at or below the -35% stop level."
+        elif current_exit_reference >= target_price:
+            decision = "EXIT_TARGET"
+            reason = "Current BID is at or above the +50% target level."
+        else:
+            decision = "HOLD"
+            reason = "Current BID remains between the stop and target levels."
+        status = "MONITORING_DRY_RUN"
+
+    exit_order_sent = False
+    exit_execution = None
+    if decision in ("EXIT_STOP", "EXIT_TARGET"):
+        exit_order_sent, exit_execution = submit_odts_sim_option_exit_order(
+            access_token, symbol, quantity=1
+        )
+        if exit_order_sent:
+            status = "EXIT_ORDER_SUBMITTED"
+        elif ODTS_SIM_EXIT_ENABLED != "YES":
+            status = "EXIT_TRIGGERED_GATE_BLOCKED"
+        else:
+            status = "EXIT_TRIGGERED_ORDER_NOT_SENT"
+
+    return jsonify({
+        "ok": True,
+        "read_only": ODTS_SIM_EXIT_ENABLED != "YES",
+        "environment": "SIM",
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "exit_order_sent": exit_order_sent,
+        "exit_execution": exit_execution,
+        "status": status,
+        "decision": decision,
+        "reason": reason,
+        "symbol": symbol,
+        "quantity_contracts": qty,
+        "actual_fill_price": avg,
+        "current_bid": bid if bid > 0 else None,
+        "current_last": last if last > 0 else None,
+        "exit_reference": "BID",
+        "max_loss_pct": 35.0,
+        "stop_option_price": stop_price,
+        "profit_target_pct": 50.0,
+        "target_option_price": target_price,
+        "unrealized_pct_from_bid": pnl_pct,
+        "unrealized_dollars_from_bid": pnl_dollars,
+        "planned_exit_action": "SELLTOCLOSE",
+        "safety": (
+            "Exit trigger is connected, but ODTS_SIM_EXIT_ENABLED is not YES, so SELLTOCLOSE is blocked."
+            if ODTS_SIM_EXIT_ENABLED != "YES"
+            else "Exit trigger is connected and SIM SELLTOCLOSE execution is enabled."
+        ),
+        "position": position,
+    })
+
+
+
+# ==============================================================
+# ODTS QQQ CONTINUOUS SIM POSITION MONITOR V1
+# ==============================================================
+
+def _odts_monitor_snapshot():
+    with odts_monitor_lock:
+        return dict(odts_monitor_state)
+
+
+def _odts_monitor_update(**kwargs):
+    with odts_monitor_lock:
+        odts_monitor_state.update(kwargs)
+
+
+
+def _odts_recover_single_qqq_option_position(access_token):
+    """
+    Recover an ODTS candidate after a Render restart.
+
+    Fail-safe rules:
+    - SIM account only.
+    - Long STOCKOPTION only.
+    - Symbol must begin QQQ.
+    - Quantity must be exactly 1.
+    - Recovery succeeds only when exactly ONE eligible position exists.
+      Zero or multiple candidates => no automatic attachment / no exit.
+    """
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/brokerage/accounts/{TS_SIM_ACCOUNT_ID}/positions"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return False, None, f"Recovery position request failed: {exc}"
+
+    if not response.ok:
+        return (
+            False,
+            None,
+            f"Recovery position request failed "
+            f"({response.status_code}): {response.text[:500]}"
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        return False, None, "Recovery position response was not valid JSON."
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        return False, None, "Recovery position response had no Positions list."
+
+    candidates = []
+
+    for raw in positions:
+        if not isinstance(raw, dict):
+            continue
+
+        symbol = str(raw.get("Symbol") or "").strip().upper()
+        asset_type = str(raw.get("AssetType") or "").strip().upper()
+        long_short = str(raw.get("LongShort") or "").strip().upper()
+
+        try:
+            qty = float(raw.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+
+        if (
+            symbol.startswith("QQQ ")
+            and asset_type == "STOCKOPTION"
+            and long_short == "LONG"
+            and qty == 1.0
+        ):
+            candidates.append(raw)
+
+    if len(candidates) == 0:
+        return True, None, "NO_ELIGIBLE_QQQ_OPTION_POSITION"
+
+    if len(candidates) > 1:
+        return (
+            False,
+            None,
+            "MULTIPLE_ELIGIBLE_QQQ_OPTION_POSITIONS - recovery blocked"
+        )
+
+    return True, candidates[0], "RECOVERED_SINGLE_QQQ_OPTION_POSITION"
+
+
+def _odts_continuous_monitor_worker():
+    _odts_monitor_update(thread_started=True, running=True, last_status="STARTED")
+
+    while True:
+        try:
+            if ODTS_CONTINUOUS_MONITOR_ENABLED != "YES":
+                _odts_monitor_update(
+                    running=False, last_status="MONITOR_GATE_OFF",
+                    last_decision="WAIT"
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            _odts_monitor_update(running=True)
+
+            if not odts_sim_session_now():
+                _odts_monitor_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="OUTSIDE_REGULAR_SESSION",
+                    last_decision="WAIT", last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            symbol = str(odts_last_order.get("symbol") or "").strip()
+
+            # After a Render restart, process memory is empty. Recover only
+            # when the SIM account contains exactly ONE eligible long QQQ
+            # option position of exactly one contract. Ambiguity blocks action.
+            if not symbol:
+                access_token, token_error = get_valid_access_token()
+
+                if not access_token:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="AUTH_REQUIRED_FOR_RECOVERY",
+                        last_decision="WAIT",
+                        last_error=token_error
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                recovered_ok, recovered, recovery_note = (
+                    _odts_recover_single_qqq_option_position(access_token)
+                )
+
+                if not recovered_ok:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="RECOVERY_SAFETY_BLOCK",
+                        last_decision="WAIT",
+                        last_error=recovery_note
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                if not recovered:
+                    _odts_monitor_update(
+                        symbol=None,
+                        last_check_at=datetime.now(timezone.utc).isoformat(),
+                        last_status="NO_ELIGIBLE_QQQ_OPTION_POSITION",
+                        last_decision="WAIT",
+                        last_bid=None,
+                        stop_price=None,
+                        target_price=None,
+                        exit_order_sent=False,
+                        exit_response=None,
+                        last_error=None
+                    )
+                    time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                    continue
+
+                symbol = str(recovered.get("Symbol") or "").strip()
+
+                # Restore only the symbol needed by the monitor. This does not
+                # fabricate a proposal/order ID or alter SOXL state.
+                odts_last_order["symbol"] = symbol
+
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="RECOVERED_AFTER_RESTART",
+                    last_decision="WAIT",
+                    exit_order_sent=False,
+                    exit_response=None,
+                    last_error=None
+                )
+
+            state = _odts_monitor_snapshot()
+            if state.get("symbol") == symbol and state.get("exit_order_sent"):
+                _odts_monitor_update(
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="EXIT_ALREADY_SUBMITTED"
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            access_token, token_error = get_valid_access_token()
+
+            if not access_token:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="AUTH_REQUIRED",
+                    last_decision="WAIT", last_error=token_error
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            ok, position, detail = get_odts_sim_option_position(access_token, symbol)
+            if not ok:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="POSITION_QUERY_FAILED",
+                    last_decision="WAIT", last_error=detail
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            if not position:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="WAITING_FOR_POSITION",
+                    last_decision="WAIT", last_bid=None, last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            try:
+                avg = float(position.get("average_price") or 0)
+                qty = float(position.get("quantity") or 0)
+                bid = float(position.get("bid") or 0)
+            except (TypeError, ValueError):
+                avg, qty, bid = 0.0, 0.0, 0.0
+
+            if avg <= 0 or qty != 1.0:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="POSITION_SAFETY_BLOCK",
+                    last_decision="WAIT",
+                    last_bid=bid if bid > 0 else None,
+                    last_error="Exactly one long contract with valid AveragePrice is required."
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            stop_price = round(avg * 0.65, 2)
+            target_price = round(avg * 1.50, 2)
+
+            if bid <= 0:
+                _odts_monitor_update(
+                    symbol=symbol,
+                    last_check_at=datetime.now(timezone.utc).isoformat(),
+                    last_status="PRICE_NOT_READY",
+                    last_decision="WAIT", last_bid=None,
+                    stop_price=stop_price, target_price=target_price,
+                    last_error=None
+                )
+                time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            if bid <= stop_price:
+                decision = "EXIT_STOP"
+            elif bid >= target_price:
+                decision = "EXIT_TARGET"
+            else:
+                decision = "HOLD"
+
+            _odts_monitor_update(
+                symbol=symbol,
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="MONITORING",
+                last_decision=decision,
+                last_bid=bid,
+                stop_price=stop_price,
+                target_price=target_price,
+                last_error=None
+            )
+
+            if decision in ("EXIT_STOP", "EXIT_TARGET"):
+                with odts_order_lock:
+                    ok2, position2, detail2 = get_odts_sim_option_position(
+                        access_token, symbol
+                    )
+                    if not ok2 or not position2:
+                        _odts_monitor_update(
+                            last_status="EXIT_REVALIDATION_FAILED",
+                            last_error=detail2
+                        )
+                    else:
+                        try:
+                            qty2 = float(position2.get("quantity") or 0)
+                        except (TypeError, ValueError):
+                            qty2 = 0.0
+
+                        if qty2 != 1.0:
+                            _odts_monitor_update(
+                                last_status="EXIT_REVALIDATION_BLOCKED",
+                                last_error="Position quantity changed; SELLTOCLOSE blocked."
+                            )
+                        else:
+                            sent, result = submit_odts_sim_option_exit_order(
+                                access_token, symbol, quantity=1
+                            )
+                            _odts_monitor_update(
+                                exit_order_sent=bool(sent),
+                                exit_response=result,
+                                last_status=(
+                                    "EXIT_ORDER_SUBMITTED"
+                                    if sent else "EXIT_TRIGGERED_ORDER_NOT_SENT"
+                                ),
+                                last_error=None if sent else result
+                            )
+
+            time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+
+        except Exception as exc:
+            log.exception("ODTS CONTINUOUS MONITOR ERROR | %s", exc)
+            _odts_monitor_update(
+                last_check_at=datetime.now(timezone.utc).isoformat(),
+                last_status="MONITOR_ERROR",
+                last_decision="WAIT",
+                last_error=str(exc)
+            )
+            time.sleep(ODTS_MONITOR_INTERVAL_SECONDS)
+
+
+def start_odts_continuous_monitor():
+    with odts_monitor_lock:
+        if odts_monitor_state.get("thread_started"):
+            return False
+        odts_monitor_state["thread_started"] = True
+
+    threading.Thread(
+        target=_odts_continuous_monitor_worker,
+        name="odts-continuous-monitor",
+        daemon=True
+    ).start()
+    return True
+
+
+
+@app.get("/odts-recovery-test")
+def odts_recovery_test():
+    """
+    READ-ONLY restart-recovery test.
+    It can identify a single eligible QQQ SIM option position after a Render
+    restart, but it NEVER changes odts_last_order and NEVER submits an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    recovered_ok, recovered, recovery_note = (
+        _odts_recover_single_qqq_option_position(access_token)
+    )
+
+    if not recovered_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "recovery_status": recovery_note,
+            "eligible_position": None,
+            "safety": (
+                "Read-only recovery test. No in-memory ODTS state is changed "
+                "and no TradeStation order function is called."
+            )
+        }), 409
+
+
+    if not recovered:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "recovery_status": recovery_note,
+            "eligible_position": None,
+            "safety": (
+                "No eligible QQQ option position was found. "
+                "No state change and no order submission occurred."
+            )
+        })
+
+    symbol = str(recovered.get("Symbol") or "").strip()
+    asset_type = str(recovered.get("AssetType") or "").strip()
+    long_short = str(recovered.get("LongShort") or "").strip()
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "recovery_status": recovery_note,
+        "eligible_position": {
+            "symbol": symbol,
+            "asset_type": asset_type,
+            "long_short": long_short,
+            "quantity": recovered.get("Quantity"),
+            "average_price": recovered.get("AveragePrice"),
+            "bid": recovered.get("Bid"),
+            "ask": recovered.get("Ask"),
+            "last": recovered.get("Last")
+        },
+        "would_be_recovered_by_continuous_monitor": True,
+        "ODTS_CONTINUOUS_MONITOR_ENABLED": ODTS_CONTINUOUS_MONITOR_ENABLED,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "safety": (
+            "READ ONLY. This endpoint does not modify odts_last_order, does "
+            "not start an exit, and does not call SELLTOCLOSE."
+        )
+    })
+
+
+@app.get("/odts-continuous-monitor-status")
+def odts_continuous_monitor_status():
+    return jsonify({
+        "ok": True,
+        "environment": "SIM",
+        "ODTS_CONTINUOUS_MONITOR_ENABLED": ODTS_CONTINUOUS_MONITOR_ENABLED,
+        "ODTS_SIM_EXIT_ENABLED": ODTS_SIM_EXIT_ENABLED,
+        "poll_interval_seconds": ODTS_MONITOR_INTERVAL_SECONDS,
+        "odts_last_order_symbol": odts_last_order.get("symbol"),
+        "state": _odts_monitor_snapshot(),
+        "safety": (
+            "Only the ODTS-created option symbol is monitored. "
+            "Automatic SELLTOCLOSE also requires ODTS_SIM_EXIT_ENABLED=YES."
+        )
+    })
+
+
+start_odts_continuous_monitor()
+start_odts_email_alert_worker()
+
+
+@app.get("/odts-process-status")
+def odts_process_status():
+    """READ ONLY diagnostic confirming the process serving this request."""
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "process_id": os.getpid(),
+        "authenticated_in_this_process": bool(token_store.get("access_token")),
+        "monitor_thread_started": _odts_monitor_snapshot().get("thread_started"),
+        "monitor_running": _odts_monitor_snapshot().get("running"),
+        "email_alert_thread_started": _odts_email_state_snapshot().get("thread_started"),
+        "email_alert_running": _odts_email_state_snapshot().get("running"),
+        "email_alert_last_status": _odts_email_state_snapshot().get("last_status"),
+        "recommended_render_start_command": "gunicorn --workers 1 --threads 4 app:app",
+        "safety": "Diagnostic only. No order function is called."
+    })
+
+
+# ==============================================================
+# POSITION
+# ==============================================================
+
+def get_soxl_position(
+    access_token
+):
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/brokerage/accounts/"
+        f"{TS_SIM_ACCOUNT_ID}"
+        f"/positions"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(
+                access_token
+            ),
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return (
+            False,
+            None,
+            {
+                "error":
+                f"Position request failed: {exc}"
+            }
+        )
+
+    try:
+        body = response.json()
+
+    except ValueError:
+        body = {
+            "raw_response":
+            response.text[:1500]
+        }
+
+    if not response.ok:
+        return (
+            False,
+            None,
+            {
+                "status_code":
+                    response.status_code,
+                "response":
+                    body
+            }
+        )
+
+    positions = (
+        body.get("Positions", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(
+        positions,
+        list
+    ):
+        positions = []
+
+    for position in positions:
+        symbol = (
+            str(
+                position.get(
+                    "Symbol",
+                    ""
+                )
+            )
+            .upper()
+            .strip()
+        )
+
+        if symbol == ALLOWED_SYMBOL:
+            raw_qty = (
+                position.get(
+                    "Quantity"
+                )
+                or position.get(
+                    "LongQuantity"
+                )
+                or 0
+            )
+
+            try:
+                quantity = float(
+                    raw_qty
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
+                quantity = 0.0
+
+            return (
+                True,
+                quantity,
+                body
+            )
+
+    return (
+        True,
+        0.0,
+        body
+    )
+
+
+# ==============================================================
+# ORDER SUBMISSION
+# ==============================================================
+
+def submit_sim_market_order(
+    access_token,
+    action
+):
+    if not sim_environment_ok():
+        return (
+            False,
+            {
+                "error":
+                "Blocked: API base URL "
+                "is not TradeStation SIM."
+            }
+        )
+
+    if not TS_SIM_ACCOUNT_ID:
+        return (
+            False,
+            {
+                "error":
+                "Blocked: TS_SIM_ACCOUNT_ID "
+                "is missing."
+            }
+        )
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/orderexecution/orders"
+    )
+
+    order = {
+        "AccountID":
+            TS_SIM_ACCOUNT_ID,
+        "Symbol":
+            ALLOWED_SYMBOL,
+        "Quantity":
+            str(MAX_TEST_QTY),
+        "OrderType":
+            "Market",
+        "TradeAction":
+            action,
+        "TimeInForce": {
+            "Duration": "DAY"
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(
+                access_token
+            ),
+            json=order,
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return (
+            False,
+            {
+                "error":
+                f"Order request failed: {exc}"
+            }
+        )
+
+    try:
+        body = response.json()
+
+    except ValueError:
+        body = {
+            "raw_response":
+            response.text[:1500]
+        }
+
+    if not response.ok:
+        return (
+            False,
+            {
+                "status_code":
+                    response.status_code,
+                "response":
+                    body,
+                "submitted_order":
+                    order,
+            }
+        )
+
+    return (
+        True,
+        body
+    )
+
+
+# ==============================================================
+# LIVE POSITION / CONFIRM / ORDER HELPERS
+# ==============================================================
+
+def get_soxl_live_position(access_token):
+    if not TS_LIVE_ACCOUNT_ID:
+        return (
+            False,
+            None,
+            {"error": "TS_LIVE_ACCOUNT_ID is missing."}
+        )
+
+    url = (
+        f"{TS_LIVE_API_BASE_URL}"
+        f"/brokerage/accounts/"
+        f"{TS_LIVE_ACCOUNT_ID}"
+        f"/positions"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            None,
+            {"error": f"LIVE position request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            None,
+            {
+                "status_code": response.status_code,
+                "response": body
+            }
+        )
+
+    positions = (
+        body.get("Positions", [])
+        if isinstance(body, dict)
+        else []
+    )
+
+    if not isinstance(positions, list):
+        positions = []
+
+    for position in positions:
+        symbol = str(position.get("Symbol", "")).upper().strip()
+        if symbol == ALLOWED_SYMBOL:
+            raw_qty = (
+                position.get("Quantity")
+                or position.get("LongQuantity")
+                or 0
+            )
+            try:
+                quantity = float(raw_qty)
+            except (TypeError, ValueError):
+                quantity = 0.0
+
+
+            return (True, quantity, body)
+
+    return (True, 0.0, body)
+
+
+def build_live_market_order(action, quantity=1):
+    return {
+        "AccountID": TS_LIVE_ACCOUNT_ID,
+        "Symbol": ALLOWED_SYMBOL,
+        "Quantity": str(quantity),
+        "OrderType": "Market",
+        "TradeAction": action,
+        "TimeInForce": {
+            "Duration": "DAY"
+        },
+        "Route": "Intelligent"
+    }
+
+
+def confirm_live_market_order(access_token, action="BUY"):
+    if action not in {"BUY", "SELL"}:
+        return (False, {"error": "action must be BUY or SELL"})
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return (False, {"error": "TS_LIVE_ACCOUNT_ID is missing."})
+
+    url = f"{TS_LIVE_API_BASE_URL}/orderexecution/orderconfirm"
+    order = build_live_market_order(action)
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            {"error": f"LIVE Confirm Order request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            {
+                "status_code": response.status_code,
+                "response": body,
+                "confirmed_order": order
+            }
+        )
+
+    return (True, body)
+
+
+def submit_live_market_order(
+    access_token,
+    action,
+    strategy_name,
+    quantity
+):
+    if action not in {"BUY", "SELL"}:
+        return (False, {"error": "action must be BUY or SELL"})
+
+    if strategy_name not in ALLOWED_STRATEGIES:
+        return (
+            False,
+            {"error": "Blocked: strategy is not authorized for LIVE."}
+        )
+
+    if LIVE_TRADING_ENABLED != "YES":
+        return (
+            False,
+            {"error": "Blocked: LIVE_TRADING_ENABLED is not YES."}
+        )
+
+    if not live_strategy_mode_selected(strategy_name):
+        return (
+            False,
+            {
+                "error": (
+                    f"Blocked: {strategy_name} execution mode "
+                    "is not LIVE."
+                )
+            }
+        )
+
+    if not live_order_capability_ready():
+        return (
+            False,
+            {"error": "Blocked: LIVE order capability is not ready."}
+        )
+
+    if not live_market_session_now():
+        return (
+            False,
+            {
+                "error": (
+                    "Blocked: LIVE Market order is outside "
+                    "09:30-16:00 ET."
+                )
+            }
+        )
+
+    url = f"{TS_LIVE_API_BASE_URL}/orderexecution/orders"
+    order = build_live_market_order(action, quantity)
+
+    try:
+        response = requests.post(
+            url,
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        return (
+            False,
+            {"error": f"LIVE order request failed: {exc}"}
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return (
+            False,
+            {
+                "status_code": response.status_code,
+                "response": body,
+                "submitted_order": order
+            }
+        )
+
+    return (True, body)
+
+
+# ==============================================================
+# DUPLICATE SIGNAL PROTECTION
+# ==============================================================
+
+def duplicate_signal(
+    action,
+    symbol,
+    strategy_name
+):
+    now = time.time()
+
+    key = (
+        f"{strategy_name}|"
+        f"{action}|"
+        f"{symbol}"
+    )
+
+    if (
+        last_signal["key"] == key
+        and now
+        - last_signal["time"]
+        < DUPLICATE_WINDOW_SECONDS
+    ):
+        return True
+
+    last_signal["key"] = key
+    last_signal["time"] = now
+
+    return False
+
+
+# ==============================================================
+# HOME / HEALTH
+# ==============================================================
+
+@app.get("/")
+def home():
+    return jsonify({
+
+        "service":
+            "ZeroLag AutoTrader",
+
+        "status":
+            "running",
+
+        "mode":
+            "TRADESTATION CONTROLLED SIM/LIVE EXECUTION",
+
+        "environment":
+            (
+                "SIM"
+                if sim_environment_ok()
+                else "BLOCKED"
+            ),
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "soxl_overnight_execution_mode":
+            SOXL_OVERNIGHT_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
+
+        "allowed_symbol":
+            ALLOWED_SYMBOL,
+
+        "allowed_strategies":
+            sorted(
+                ALLOWED_STRATEGIES
+            ),
+
+        "max_test_quantity":
+            MAX_TEST_QTY,
+
+        "journal_available":
+            True,
+
+        "tv_csv":
+            "/journal/tv.csv",
+
+        "ts_csv":
+            "/journal/ts.csv",
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok":
+            True,
+
+        "service":
+            "ZeroLag AutoTrader",
+
+        "api_base":
+            TS_API_BASE_URL,
+
+        "sim_environment_ok":
+            sim_environment_ok(),
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+    })
+
+
+# ==============================================================
+# JOURNAL ROUTES
+# ==============================================================
+
+@app.get("/journal/status")
+def journal_status():
+    ensure_journal_files()
+
+    def count_rows(path):
+        try:
+            with open(
+                path,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                return max(
+                    sum(1 for _ in f) - 1,
+                    0
+                )
+
+        except Exception:
+            return 0
+
+    return jsonify({
+        "ok":
+            True,
+
+        "journal_dir":
+            JOURNAL_DIR,
+
+        "tv_rows":
+            count_rows(
+                TV_CSV_PATH
+            ),
+
+        "ts_rows":
+            count_rows(
+                TS_CSV_PATH
+            ),
+
+        "tv_csv":
+            "/journal/tv.csv",
+
+        "ts_csv":
+            "/journal/ts.csv",
+
+        "storage_note":
+            "Default /tmp storage is temporary "
+            "until a Render persistent disk "
+            "is mounted.",
+    })
+
+
+@app.get("/journal/tv.csv")
+def download_tv_csv():
+    ensure_journal_files()
+
+    return send_file(
+        TV_CSV_PATH,
+        mimetype="text/csv",
+        as_attachment=False,
+        download_name="TV_Signals.csv"
+    )
+
+
+@app.get("/journal/ts.csv")
+def download_ts_csv():
+    ensure_journal_files()
+
+    return send_file(
+        TS_CSV_PATH,
+        mimetype="text/csv",
+        as_attachment=False,
+        download_name="TS_Executions.csv"
+    )
+
+
+# ==============================================================
+# AUTH STATUS
+# ==============================================================
+
+@app.get("/auth-status")
+def auth_status():
+    missing = missing_config()
+
+    return jsonify({
+        "configured":
+            len(missing) == 0,
+
+        "missing_environment_variables":
+            missing,
+
+        "authenticated":
+            bool(
+                token_store.get(
+                    "access_token"
+                )
+            ),
+
+        "refresh_token_present":
+            bool(
+
+                token_store.get(
+                    "refresh_token"
+                )
+            ),
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+
+        "sim_environment_ok":
+            sim_environment_ok(),
+
+        "api_base":
+            TS_API_BASE_URL,
+
+        "live_api_base":
+            TS_LIVE_API_BASE_URL,
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "soxl_overnight_execution_mode":
+            SOXL_OVERNIGHT_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_account_configured":
+            bool(TS_LIVE_ACCOUNT_ID),
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
+
+        "redirect_uri":
+            TS_REDIRECT_URI,
+    })
+
+
+# ==============================================================
+# LOGIN
+# ==============================================================
+
+@app.get("/login")
+def login():
+    global oauth_state
+
+    missing = [
+        x
+        for x in [
+            "TS_CLIENT_ID",
+            "TS_CLIENT_SECRET",
+            "TS_REDIRECT_URI"
+        ]
+        if not os.getenv(
+            x,
+            ""
+        ).strip()
+    ]
+
+    if missing:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "Missing Render "
+                "environment variables",
+
+            "missing":
+                missing
+        }), 500
+
+    oauth_state = (
+        secrets.token_urlsafe(32)
+    )
+
+    params = {
+        "response_type":
+            "code",
+
+        "client_id":
+            TS_CLIENT_ID,
+
+        "audience":
+            TS_AUDIENCE,
+
+        "redirect_uri":
+            TS_REDIRECT_URI,
+
+        "scope":
+            TS_SCOPES,
+
+        "state":
+            oauth_state,
+
+        "prompt":
+            "login",
+    }
+
+    return redirect(
+        f"{TS_AUTHORIZE_URL}?"
+        f"{urlencode(params)}"
+    )
+
+
+# ==============================================================
+# AUTH CALLBACK
+# ==============================================================
+
+@app.get("/auth/callback")
+def auth_callback():
+    global oauth_state
+
+    error = request.args.get(
+        "error"
+    )
+
+    if error:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                error,
+
+            "error_description":
+                request.args.get(
+                    "error_description",
+                    ""
+                ),
+        }), 400
+
+    code = request.args.get(
+        "code"
+    )
+
+    returned_state = (
+        request.args.get(
+            "state"
+        )
+    )
+
+    if not code:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "No authorization code "
+                "was returned by TradeStation."
+        }), 400
+
+    if (
+        not oauth_state
+        or returned_state
+        != oauth_state
+    ):
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "OAuth state check failed. "
+                "Please restart at /login."
+        }), 400
+
+    payload = {
+        "grant_type":
+            "authorization_code",
+
+        "client_id":
+            TS_CLIENT_ID,
+
+        "client_secret":
+            TS_CLIENT_SECRET,
+
+        "code":
+            code,
+
+
+        "redirect_uri":
+            TS_REDIRECT_URI,
+    }
+
+    try:
+        response = requests.post(
+            TS_TOKEN_URL,
+            data=payload,
+            headers={
+                "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                f"Token request failed: {exc}"
+        }), 502
+
+    oauth_state = None
+
+    if not response.ok:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "TradeStation token "
+                "exchange failed",
+
+            "status_code":
+                response.status_code,
+
+            "details":
+                response.text[:1000],
+        }), response.status_code
+
+    data = response.json()
+
+    if not data.get(
+        "access_token"
+    ):
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "TradeStation response "
+                "did not contain an access token."
+        }), 502
+
+    save_token_response(
+        data
+    )
+
+    return """
+    <html>
+    <body style="font-family:Arial,sans-serif;margin:40px;">
+    <h2>TradeStation authentication successful.</h2>
+    <p>Render received an access token successfully.</p>
+    <p><strong>Trading remains controlled by TRADING_ENABLED.</strong></p>
+    <p><a href="/account-test">Test TradeStation SIM account connection</a></p>
+    <p><a href="/live-account-test">Test TradeStation LIVE accounts - READ ONLY</a></p>
+    <p><a href="/live-position-test">Test SOXL LIVE position - READ ONLY</a></p>
+    <p><a href="/live-confirm-buy-test">Confirm 1-share SOXL LIVE BUY - NO ORDER</a></p>
+    <p><a href="/position-test">Test SOXL SIM position</a></p>
+    <p><a href="/auth-status">View authentication status</a></p>
+    </body>
+    </html>
+    """
+
+
+# ==============================================================
+# ACCOUNT TEST
+# ==============================================================
+
+@app.get("/account-test")
+def account_test():
+    access_token, error = (
+        get_valid_access_token()
+    )
+
+    if not access_token:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                error,
+
+            "next_step":
+                "Open /login"
+        }), 401
+
+    url = (
+        f"{TS_API_BASE_URL}"
+        f"/brokerage/accounts"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Authorization":
+                    f"Bearer {access_token}",
+
+                "Accept":
+                    "application/json"
+            },
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                f"Account request failed: {exc}"
+        }), 502
+
+    try:
+        body = response.json()
+
+    except ValueError:
+        body = {
+            "raw_response":
+                response.text[:1500]
+        }
+
+    if not response.ok:
+        return jsonify({
+            "ok":
+                False,
+
+            "status_code":
+                response.status_code,
+
+            "endpoint":
+                "/brokerage/accounts",
+
+            "response":
+                body,
+        }), response.status_code
+
+    return jsonify({
+        "ok":
+            True,
+
+        "environment":
+            (
+                "SIM"
+                if sim_environment_ok()
+                else "BLOCKED"
+            ),
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+
+        "tradestation_response":
+            body,
+    })
+
+
+# ==============================================================
+# LIVE ACCOUNT TEST - READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/live-account-test")
+def live_account_test():
+    access_token, error = get_valid_access_token()
+
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    url = (
+        f"{TS_LIVE_API_BASE_URL}"
+        f"/brokerage/accounts"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json"
+            },
+            timeout=20
+        )
+
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "live_order_submission_enabled": False,
+            "error": f"LIVE account request failed: {exc}"
+        }), 502
+
+    try:
+        body = response.json()
+
+    except ValueError:
+        body = {
+            "raw_response": response.text[:1500]
+        }
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "live_order_submission_enabled": False,
+            "status_code": response.status_code,
+            "endpoint": "/brokerage/accounts",
+            "response": body
+        }), response.status_code
+
+    return jsonify({
+        "ok": True,
+        "environment": "LIVE",
+        "live_api_base": TS_LIVE_API_BASE_URL,
+        "live_order_submission_enabled": False,
+        "message": (
+            "LIVE accounts retrieved successfully. "
+            "This route cannot place an order."
+        ),
+        "tradestation_response": body
+    })
+
+
+# ==============================================================
+# LIVE POSITION TEST - READ ONLY
+# ==============================================================
+
+@app.get("/live-position-test")
+def live_position_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "TS_LIVE_ACCOUNT_ID is not configured in Render.",
+            "live_order_submission_enabled": False
+        }), 503
+
+    ok, quantity, body = get_soxl_live_position(access_token)
+
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "LIVE SOXL position query failed.",
+            "details": body
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "environment": "LIVE",
+        "symbol": ALLOWED_SYMBOL,
+        "quantity": quantity,
+        "is_long": quantity > 0,
+        "live_order_submission_enabled": (
+            LIVE_TRADING_ENABLED == "YES"
+            and (
+                live_regular_mode_selected()
+                or live_overnight_mode_selected()
+            )
+        ),
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+        "soxl_overnight_execution_mode":
+            SOXL_OVERNIGHT_EXECUTION_MODE
+    })
+
+
+# ==============================================================
+# LIVE CONFIRM ORDER TEST - NO ORDER IS PLACED
+# ==============================================================
+
+@app.get("/live-confirm-buy-test")
+def live_confirm_buy_test():
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "error": error,
+            "next_step": "Open /login"
+        }), 401
+
+    if not TS_LIVE_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "error": "TS_LIVE_ACCOUNT_ID is not configured in Render.",
+            "order_sent": False
+        }), 503
+
+    ok, body = confirm_live_market_order(access_token, "BUY")
+
+    if not ok:
+        return jsonify({
+            "ok": False,
+            "environment": "LIVE",
+            "order_sent": False,
+            "error": "TradeStation Confirm Order failed.",
+            "details": body
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "environment": "LIVE",
+        "symbol": ALLOWED_SYMBOL,
+        "quantity": 1,
+        "action": "BUY",
+        "order_sent": False,
+        "message": (
+            "TradeStation Confirm Order succeeded. "
+            "No LIVE order was placed."
+        ),
+        "tradestation_confirmation": body
+    })
+
+
+# ==============================================================
+# POSITION TEST
+# ==============================================================
+
+@app.get("/position-test")
+def position_test():
+    access_token, error = (
+        get_valid_access_token()
+    )
+
+    if not access_token:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+
+                error,
+
+            "next_step":
+                "Open /login"
+        }), 401
+
+    (
+        ok,
+        quantity,
+        body
+    ) = get_soxl_position(
+        access_token
+    )
+
+    if not ok:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "TradeStation position "
+                "query failed",
+
+            "details":
+                body,
+        }), 502
+
+    return jsonify({
+        "ok":
+            True,
+
+        "symbol":
+            ALLOWED_SYMBOL,
+
+        "quantity":
+            quantity,
+
+        "is_long":
+            quantity > 0,
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+    })
+
+
+# ==============================================================
+# WEBHOOK
+# ==============================================================
+
+@app.post("/webhook/<token>")
+def webhook(token):
+
+    # ----------------------------------------------------------
+    # TOKEN CHECK
+    # ----------------------------------------------------------
+
+    if (
+        not WEBHOOK_TOKEN
+        or token != WEBHOOK_TOKEN
+    ):
+        log.warning(
+            "Rejected webhook: invalid token"
+        )
+
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "Unauthorized webhook token"
+        }), 401
+
+
+    # ----------------------------------------------------------
+    # JSON CHECK
+    # ----------------------------------------------------------
+
+    if not request.is_json:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "JSON body required"
+        }), 400
+
+
+    # ----------------------------------------------------------
+    # READ SIGNAL
+    # ----------------------------------------------------------
+
+    payload = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
+
+    action = (
+        str(
+            payload.get(
+                "action",
+                ""
+            )
+        )
+        .upper()
+        .strip()
+    )
+
+    symbol = (
+        str(
+            payload.get(
+                "symbol",
+                ""
+            )
+        )
+        .upper()
+        .strip()
+    )
+
+    strategy_name = (
+        str(
+            payload.get(
+                "strategy",
+                ""
+            )
+        )
+        .strip()
+    )
+
+    # Both authorized SOXL strategies take quantity from TradingView.
+    # parse_share_quantity enforces the 1-to-10 live safety range.
+    quantity, quantity_error = parse_share_quantity(payload)
+
+    if quantity_error:
+        return jsonify({
+            "ok": False,
+            "received": True,
+            "order_sent": False,
+            "error": quantity_error,
+        }), 400
+
+
+    # ----------------------------------------------------------
+    # ACTION CHECK
+    # ----------------------------------------------------------
+
+    if action not in {
+        "BUY",
+        "SELL"
+    }:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "action must be BUY or SELL"
+        }), 400
+
+
+    # ----------------------------------------------------------
+    # SYMBOL SAFETY
+    # ----------------------------------------------------------
+
+    if symbol != ALLOWED_SYMBOL:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                f"Only {ALLOWED_SYMBOL} "
+                "is allowed by this execution service.",
+        }), 400
+
+
+    # ----------------------------------------------------------
+    # STRATEGY SAFETY
+    # ONLY THE TWO CURRENT STRATEGIES MAY TRADE
+    # ----------------------------------------------------------
+
+    if (
+        strategy_name
+        not in ALLOWED_STRATEGIES
+    ):
+        log.warning(
+            "STRATEGY BLOCKED | "
+            "strategy=%s action=%s "
+            "symbol=%s | allowed=%s",
+            strategy_name,
+
+            action,
+            symbol,
+            sorted(
+                ALLOWED_STRATEGIES
+            )
+        )
+
+        return jsonify({
+            "ok":
+                False,
+
+            "received":
+                True,
+
+            "order_sent":
+                False,
+
+            "error":
+                "Strategy is not authorized "
+                "for this execution service.",
+
+            "strategy":
+                strategy_name,
+
+            "allowed_strategies":
+                sorted(
+                    ALLOWED_STRATEGIES
+                ),
+        }), 403
+
+
+    # ----------------------------------------------------------
+    # RECORD WEBHOOK
+    # ----------------------------------------------------------
+
+    last_webhook["received"] = True
+
+    last_webhook["payload"] = (
+        payload
+    )
+
+    last_webhook["received_at"] = (
+        time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime()
+        )
+    )
+
+    journal_tv_signal(
+        payload,
+        action,
+        symbol,
+        strategy_name
+    )
+
+    log.info(
+        "WEBHOOK | strategy=%s "
+        "action=%s symbol=%s qty=%s "
+        "trading_enabled=%s",
+        strategy_name,
+        action,
+        symbol,
+        quantity,
+        TRADING_ENABLED
+    )
+
+
+    # ----------------------------------------------------------
+    # MASTER TRADING SWITCH
+    # ----------------------------------------------------------
+
+    if TRADING_ENABLED != "YES":
+        return jsonify({
+            "ok":
+                True,
+
+            "received":
+                True,
+
+            "dry_run":
+                True,
+
+            "trading_enabled":
+                TRADING_ENABLED,
+
+            "orders_available":
+                order_capability_ready(),
+
+            "message":
+                "Webhook received. "
+                "Trading is disabled; "
+                "no TradeStation order was sent.",
+        }), 200
+
+
+    # ----------------------------------------------------------
+    # SOXL LIVE ROUTE - REGULAR + OVERNIGHT INDEPENDENT
+    #
+    # Each TradingView strategy owns its own BUY/SELL sequence.
+    # Regular and Overnight may each submit 1 to 10 shares.
+    # No BUY inheritance and no cross-strategy handoff.
+    # ----------------------------------------------------------
+
+    if live_strategy_mode_selected(strategy_name):
+        if LIVE_TRADING_ENABLED != "YES":
+            return jsonify({
+                "ok": True, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "message": "LIVE_TRADING_ENABLED is not YES; no order sent."
+            }), 200
+
+        if not live_order_capability_ready():
+            return jsonify({
+                "ok": False, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "error": "LIVE order capability is not ready."
+            }), 503
+
+        if not live_market_session_now():
+            return jsonify({
+                "ok": True, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "message": "LIVE order blocked outside 09:30-16:00 ET regular session."
+            }), 200
+
+        if duplicate_signal(action, symbol, strategy_name):
+            return jsonify({
+                "ok": True, "received": True, "duplicate_blocked": True,
+                "order_sent": False, "environment": "LIVE",
+                "strategy": strategy_name,
+                "message": "Duplicate LIVE signal blocked."
+            }), 200
+
+        access_token, error = get_valid_access_token()
+        if not access_token:
+            return jsonify({
+                "ok": False, "received": True, "order_sent": False,
+                "environment": "LIVE", "strategy": strategy_name,
+                "error": "TradeStation authentication is required.",
+                "details": error, "next_step": "Open /login"
+            }), 401
+
+        # Serialize account check + order submission so simultaneous
+        # Regular/Overnight signals cannot race each other.
+        with live_order_lock:
+            pos_ok, position_qty, pos_body = get_soxl_live_position(access_token)
+
+            if not pos_ok:
+                return jsonify({
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "error": "LIVE position verification failed. Order blocked.",
+                    "details": pos_body
+                }), 502
+
+            # Long-only account protection. Both authorized strategies use
+            # the validated TradingView quantity.
+            if position_qty < 0:
+                return jsonify({
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "error": "LIVE safety block: an existing short SOXL position was detected.",
+                    "position_quantity": position_qty
+                }), 409
+
+            # Never allow a SELL larger than the actual long position.
+            if action == "SELL" and quantity > position_qty:
+                return jsonify({
+                    "ok": True, "received": True, "order_sent": False,
+
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "message": "LIVE SELL blocked: requested quantity exceeds the current long position.",
+                    "requested_quantity": quantity,
+                    "position_quantity": position_qty,
+                }), 200
+
+            order_ok, order_response = submit_live_market_order(
+                access_token, action, strategy_name, quantity
+            )
+
+            if not order_ok:
+                log.error(
+                    "LIVE ORDER FAILED | strategy=%s action=%s symbol=%s response=%s",
+                    strategy_name, action, symbol, order_response
+                )
+                return jsonify({
+                    "ok": False, "received": True, "order_sent": False,
+                    "environment": "LIVE", "strategy": strategy_name,
+                    "error": "TradeStation LIVE order submission failed.",
+                    "details": order_response
+                }), 502
+
+            log.warning(
+                "LIVE ORDER SENT | strategy=%s action=%s symbol=%s qty=%s "
+                "account_position_before=%s response=%s",
+                strategy_name, action, symbol, quantity,
+                position_qty, order_response
+            )
+
+            return jsonify({
+                "ok": True, "received": True, "dry_run": False,
+                "order_sent": True, "environment": "LIVE",
+                "strategy": strategy_name, "symbol": symbol,
+                "action": action, "quantity": quantity,
+                "account_position_before": position_qty,
+                "tradestation_response": order_response
+            }), 200
+
+
+    # ----------------------------------------------------------
+    # SIM-ONLY PROTECTION
+    # ----------------------------------------------------------
+
+    if not sim_environment_ok():
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "Order blocked because "
+                "TS_API_BASE_URL is not SIM.",
+        }), 403
+
+
+    # ----------------------------------------------------------
+    # CONFIGURATION CHECK
+    # ----------------------------------------------------------
+
+    if not order_capability_ready():
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "Order capability is not ready.",
+
+            "missing":
+                missing_config(),
+        }), 503
+
+
+    # ----------------------------------------------------------
+    # DUPLICATE SIGNAL CHECK
+    # ----------------------------------------------------------
+
+    if duplicate_signal(
+        action,
+        symbol,
+        strategy_name
+    ):
+        return jsonify({
+            "ok":
+                True,
+
+            "received":
+                True,
+
+            "duplicate_blocked":
+                True,
+
+            "message":
+                "Duplicate signal blocked. "
+                "No order was sent.",
+        }), 200
+
+
+    # ----------------------------------------------------------
+    # AUTHENTICATION
+    # ----------------------------------------------------------
+
+    access_token, error = (
+        get_valid_access_token()
+    )
+
+    if not access_token:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "TradeStation authentication "
+                "is required.",
+
+            "details":
+                error,
+
+            "next_step":
+                "Open /login",
+        }), 401
+
+
+    # ----------------------------------------------------------
+    # CHECK ACTUAL TS SOXL POSITION
+    # ----------------------------------------------------------
+
+    (
+        pos_ok,
+        position_qty,
+        pos_body
+    ) = get_soxl_position(
+        access_token
+    )
+
+    if not pos_ok:
+        return jsonify({
+            "ok":
+                False,
+
+            "error":
+                "Position verification failed. "
+                "Order blocked.",
+
+            "details":
+                pos_body,
+        }), 502
+
+
+    # ----------------------------------------------------------
+    # REGULAR -> OVERNIGHT HANDOFF
+    #
+    # If a BUY arrives while TS already owns SOXL:
+    # KEEP THE EXISTING POSITION.
+    # DO NOT BUY A SECOND SHARE.
+    # ----------------------------------------------------------
+
+    if (
+        action == "BUY"
+        and position_qty > 0
+    ):
+        log.info(
+            "HANDOFF / BUY BLOCKED | "
+            "strategy=%s symbol=%s "
+            "existing_position=%s | "
+            "Existing SOXL long retained; "
+            "no duplicate BUY sent.",
+            strategy_name,
+            symbol,
+            position_qty
+        )
+
+        return jsonify({
+            "ok":
+                True,
+
+            "received":
+                True,
+
+            "order_sent":
+                False,
+
+            "handoff":
+
+                True,
+
+            "strategy":
+                strategy_name,
+
+            "message":
+                "Existing SOXL long retained. "
+                "No duplicate BUY sent.",
+
+            "position_quantity":
+                position_qty,
+        }), 200
+
+
+    # ----------------------------------------------------------
+    # SELL SAFETY
+    #
+    # NEVER CREATE AN ACCIDENTAL SHORT.
+    # ----------------------------------------------------------
+
+    if (
+        action == "SELL"
+        and position_qty <= 0
+    ):
+        log.info(
+            "SELL BLOCKED | "
+            "strategy=%s symbol=%s "
+            "existing_position=%s | "
+            "Account already flat; "
+            "no SELL sent.",
+            strategy_name,
+            symbol,
+            position_qty
+        )
+
+        return jsonify({
+            "ok":
+                True,
+
+            "received":
+                True,
+
+            "order_sent":
+                False,
+
+            "strategy":
+                strategy_name,
+
+            "message":
+                "SELL blocked: "
+                "account already flat.",
+
+            "position_quantity":
+                position_qty,
+        }), 200
+
+
+    # ----------------------------------------------------------
+    # SEND SIM ORDER
+    # ----------------------------------------------------------
+
+    order_ok, order_response = (
+        submit_sim_market_order(
+            access_token,
+            action
+        )
+    )
+
+    if not order_ok:
+        log.error(
+            "SIM ORDER FAILED | "
+            "action=%s symbol=%s "
+            "response=%s",
+            action,
+            symbol,
+            order_response
+        )
+
+        return jsonify({
+            "ok":
+                False,
+
+            "received":
+                True,
+
+            "order_sent":
+                False,
+
+            "error":
+                "TradeStation SIM "
+                "order submission failed.",
+
+            "details":
+                order_response,
+        }), 502
+
+
+    # ----------------------------------------------------------
+    # ORDER SUCCESS
+    # ----------------------------------------------------------
+
+    log.info(
+        "SIM ORDER SENT | "
+        "action=%s symbol=%s "
+        "qty=%s response=%s",
+        action,
+        symbol,
+        MAX_TEST_QTY,
+        order_response
+    )
+
+
+    # ----------------------------------------------------------
+    # BACKGROUND JOURNAL
+    # ----------------------------------------------------------
+
+    threading.Thread(
+        target=journal_ts_execution_background,
+        args=(
+            access_token,
+            action,
+            order_response
+        ),
+        daemon=True
+    ).start()
+
+
+    # ----------------------------------------------------------
+    # WEBHOOK RESPONSE
+    # ----------------------------------------------------------
+
+    return jsonify({
+        "ok":
+            True,
+
+        "received":
+            True,
+
+        "dry_run":
+            False,
+
+        "order_sent":
+            True,
+
+        "environment":
+            "SIM",
+
+        "strategy":
+            strategy_name,
+
+        "symbol":
+            symbol,
+
+        "action":
+            action,
+
+        "quantity":
+            MAX_TEST_QTY,
+
+        "tradestation_response":
+            order_response,
+
+        "journal":
+            "queued",
+    }), 200
+
+
+# ==============================================================
+# WEBHOOK STATUS
+# ==============================================================
+
+@app.get("/webhook-status")
+def webhook_status():
+    return jsonify({
+        "ok":
+            True,
+
+        "last_webhook_received":
+            last_webhook["received"],
+
+
+        "received_at":
+            last_webhook["received_at"],
+
+        "payload":
+            last_webhook["payload"],
+
+        "trading_enabled":
+            TRADING_ENABLED,
+
+        "orders_available":
+            order_capability_ready(),
+
+        "soxl_regular_execution_mode":
+            SOXL_REGULAR_EXECUTION_MODE,
+
+        "live_trading_enabled":
+            LIVE_TRADING_ENABLED,
+
+        "live_order_capability_ready":
+            live_order_capability_ready(),
+    })
+
+
+
+# ==============================================================
+# #10 ODTS QQQ VERTICAL V1 - READ ONLY SELECTOR
+# SIM DESIGN / NO ORDER SUBMISSION / NO APPROVE-PASS EXECUTION
+# ==============================================================
+
+@app.get("/odts-vertical-test")
+def odts_vertical_test():
+    """
+    QQQ Vertical V1 read-only selector.
+
+    Moderate Risk SIM test rules:
+      - BULLISH only -> Bull Call Debit Spread
+      - Bearish/neutral conditions remain WAIT; no Bear Put selection
+      - Monthly or Weekly expiration, exactly 1 or 2 calendar DTE
+      - Long-leg Delta 0.45 to 0.60
+      - Short-leg Delta 0.30 to 0.40
+      - Net Delta +0.05 to +0.30
+      - Short leg exactly $2 away, same expiration
+      - Each leg requires OI >=500 and Bid/Ask width <=$0.10 and <=10%
+      - Net Theta burden <=10% of net debit
+      - Net debit >$0 and <=$1.10; maximum loss <=$110
+      - Maximum profit >=$90; reward:risk >=0.80:1
+      - One spread, SIM design only
+      - Entry window 10:00 AM to 3:00 PM ET
+      - Profit exit at +50% of maximum possible profit
+      - Protective exit at -50% of original net debit
+      - Mandatory time exit 3:45 PM ET
+
+    This route NEVER submits, modifies, cancels, or closes an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    indicators_ok, indicators = _odts_indicator_snapshot()
+    if not indicators_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": indicators.get("error", "Unable to read QQQ indicators."),
+        }), int(indicators.get("status_code", 502) or 502)
+
+    # ----------------------------------------------------------
+    # MODERATE RISK SIM TEST RULES
+    # ----------------------------------------------------------
+    underlying = "QQQ"
+    allowed_dte = {1, 2}
+    spread_width = 2.0
+    long_delta_min = 0.45
+    long_delta_max = 0.60
+    long_delta_mid = (long_delta_min + long_delta_max) / 2.0
+    short_delta_min = 0.30
+    short_delta_max = 0.40
+    net_delta_min = 0.05
+    net_delta_max = 0.30
+    max_leg_spread_dollars = 0.10
+    max_leg_spread_pct = 10.0
+    min_open_interest = 500
+    max_theta_burden_pct = 10.0
+    max_net_debit = 1.10
+    max_loss_dollars_allowed = 110.0
+    min_max_profit_dollars = 90.0
+    min_reward_risk = 0.80
+    quantity_spreads = 1
+    strike_proximity = 18
+
+    # ----------------------------------------------------------
+    # EXISTING ODTS MARKET/DIRECTION GATES
+    # ----------------------------------------------------------
+    zlema_state = int(indicators.get("zlema_state", 0) or 0)
+    zlema_confirm = int(indicators.get("zlema_confirm", 0) or 0)
+    qqq_close = _odts_float(indicators.get("qqq_close"), None)
+    vwap = _odts_float(indicators.get("vwap"), None)
+    ema21 = _odts_float(indicators.get("ema21"), None)
+    adx14 = _odts_float(indicators.get("adx14"), None)
+
+    if zlema_state > 0:
+        direction = "BULLISH"
+        vertical_type = "BULL CALL"
+        option_type_needed = "CALL"
+    elif zlema_state < 0:
+        direction = "BEARISH"
+        vertical_type = ""
+        option_type_needed = ""
+    else:
+        direction = "NEUTRAL"
+        vertical_type = ""
+        option_type_needed = ""
+
+    trend_alignment_gate = "WAIT"
+    if (
+        direction == "BULLISH"
+        and qqq_close is not None
+        and vwap is not None
+        and ema21 is not None
+        and qqq_close > vwap
+        and qqq_close > ema21
+    ):
+        trend_alignment_gate = "YES"
+
+    zlema_confirmation_gate = "YES" if zlema_confirm >= 2 else "WAIT"
+
+    if adx14 is not None and adx14 >= 20.0:
+        adx_gate = "YES"
+    elif adx14 is not None and adx14 >= 15.0:
+        adx_gate = "CAUTION"
+    else:
+        adx_gate = "WAIT"
+
+    dt = now_et()
+    minutes_now = dt.hour * 60 + dt.minute
+    weekday_ok = dt.weekday() <= 4
+    entry_window_open = weekday_ok and (10 * 60) <= minutes_now < (15 * 60)
+    entry_window_gate = "YES" if entry_window_open else "WAIT"
+
+    market_gate_ready = (
+        direction == "BULLISH"
+        and trend_alignment_gate == "YES"
+        and zlema_confirmation_gate == "YES"
+        and adx_gate in {"YES", "CAUTION"}
+    )
+
+    # No need to stream an option chain when the market direction is neutral.
+    if direction != "BULLISH":
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "QQQ_VERTICAL_V1",
+            "environment": "SIM",
+            "underlying": underlying,
+            "direction": direction,
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_vertical": None,
+            "gates": {
+                "trend_alignment": trend_alignment_gate,
+                "zlema_confirmation": zlema_confirmation_gate,
+                "adx": adx_gate,
+                "entry_window": entry_window_gate,
+                "vertical_contract": "WAIT",
+                "delta": "WAIT",
+                "liquidity": "WAIT",
+                "theta_burden": "WAIT",
+                "net_debit": "WAIT",
+
+                "max_loss": "WAIT",
+                "max_profit": "WAIT",
+                "reward_risk": "WAIT",
+            },
+            "rules": {
+                "spread_width": spread_width,
+                "allowed_dte": sorted(allowed_dte),
+                "long_abs_delta": [long_delta_min, long_delta_max],
+                "short_abs_delta": [short_delta_min, short_delta_max],
+                "net_delta": [net_delta_min, net_delta_max],
+                "max_leg_spread_dollars": max_leg_spread_dollars,
+                "max_leg_spread_pct": max_leg_spread_pct,
+                "min_open_interest_each_leg": min_open_interest,
+                "max_theta_burden_pct": max_theta_burden_pct,
+                "max_net_debit": max_net_debit,
+                "max_loss_dollars": max_loss_dollars_allowed,
+                "min_max_profit_dollars": min_max_profit_dollars,
+                "min_reward_risk": min_reward_risk,
+                "quantity_spreads": quantity_spreads,
+                "entry_window_et": "10:00-15:00",
+                "time_exit_et": "15:45",
+            },
+        }), 200
+
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for candidate in (raw, raw.replace("Z", "+00:00"), raw[:10]):
+            try:
+                return datetime.fromisoformat(candidate).date()
+            except Exception:
+                pass
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(raw[:10], fmt).date()
+            except Exception:
+                pass
+        return None
+
+    def leg_from_item(item, expiration_date, dte):
+        if not isinstance(item, dict):
+            return None
+        if item.get("StreamStatus") or item.get("Error"):
+            return None
+
+        legs = item.get("Legs", [])
+        leg = (
+            legs[0]
+            if isinstance(legs, list)
+            and legs
+            and isinstance(legs[0], dict)
+            else {}
+        )
+
+        option_type = str(
+            item.get("Side") or leg.get("OptionType") or ""
+        ).strip().upper()
+        if option_type != option_type_needed:
+            return None
+
+        strike = safe_float(leg.get("StrikePrice"))
+        if strike is None:
+            strikes = item.get("Strikes", [])
+            if isinstance(strikes, list) and strikes:
+                strike = safe_float(strikes[0])
+        if strike is None:
+            return None
+
+        bid = safe_float(item.get("Bid"))
+        ask = safe_float(item.get("Ask"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+            return None
+
+        mid = safe_float(item.get("Mid"))
+        if mid is None or mid <= 0:
+            mid = (bid + ask) / 2.0
+
+        leg_spread = ask - bid
+        leg_spread_pct = (leg_spread / mid) * 100.0 if mid > 0 else None
+        if leg_spread_pct is None:
+            return None
+
+        delta_raw = safe_float(item.get("Delta"))
+        symbol = str(leg.get("Symbol") or item.get("Symbol") or "").strip()
+
+        return {
+            "symbol": symbol,
+            "option_type": option_type.title(),
+            "expiration": expiration_date.isoformat(),
+            "dte": dte,
+            "strike": round(strike, 4),
+            "bid": round(bid, 4),
+            "ask": round(ask, 4),
+            "mid": round(mid, 4),
+            "spread_pct": round(leg_spread_pct, 4),
+            "spread_dollars": round(leg_spread, 4),
+            "delta": round(delta_raw, 6) if delta_raw is not None else "",
+            "abs_delta": round(abs(delta_raw), 6) if delta_raw is not None else "",
+            "theta": round(safe_float(item.get("Theta")), 6) if safe_float(item.get("Theta")) is not None else "",
+            "volume": safe_int(item.get("Volume"), 0),
+            "open_interest": safe_int(item.get("DailyOpenInterest"), 0),
+        }
+
+    # ----------------------------------------------------------
+    # 1) ELIGIBLE MONTHLY OR WEEKLY EXPIRATIONS AT EXACTLY 1 OR 2 DTE
+    # ----------------------------------------------------------
+    expiration_url = f"{TS_API_BASE_URL}/marketdata/options/expirations/{underlying}"
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": f"QQQ expiration request failed: {exc}",
+        }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000],
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_VERTICAL_V1",
+            "error": "TradeStation expiration response was not valid JSON.",
+        }), 502
+
+    today_et = now_et().date()
+    eligible_expirations = []
+    for expiration_item in (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    ):
+        if not isinstance(expiration_item, dict):
+            continue
+        expiration_date = parse_expiration(expiration_item.get("Date"))
+        if expiration_date is None:
+            continue
+        dte = (expiration_date - today_et).days
+        expiration_type = str(expiration_item.get("Type", "")).strip()
+        # Accept every TradeStation-listed QQQ expiration at 1-2 DTE.
+        # This includes regular Monthly and Weekly expirations while the
+        # frozen allowed_dte set continues to exclude 0 DTE.
+        if dte in allowed_dte:
+            eligible_expirations.append({
+                "date": expiration_date,
+                "dte": dte,
+                "type": expiration_type,
+            })
+
+
+    eligible_expirations.sort(key=lambda item: (item["dte"], item["date"]))
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "QQQ_VERTICAL_V1",
+            "environment": "SIM",
+            "underlying": underlying,
+            "direction": direction,
+            "vertical_type": vertical_type,
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_vertical": None,
+            "error": "No QQQ Monthly or Weekly expiration was found at exactly 1 or 2 calendar DTE.",
+        }), 200
+
+    # ----------------------------------------------------------
+    # 2) CAPTURE SINGLE-LEG SNAPSHOTS AND BUILD $2 VERTICALS
+    # ----------------------------------------------------------
+    chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+    vertical_candidates = []
+    stream_notes = []
+
+    for expiry in eligible_expirations:
+        expiration_date = expiry["date"]
+        chain_params = {
+            "expiration": expiration_date.strftime("%m-%d-%Y"),
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "Call" if option_type_needed == "CALL" else "Put",
+        }
+
+        chain_response = None
+        legs_by_strike = {}
+        message_count = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(5, 5),
+            )
+
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500],
+                })
+                continue
+
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                    break
+
+                message_count += 1
+                leg = leg_from_item(item, expiration_date, expiry["dte"])
+                if leg is not None:
+                    legs_by_strike[round(float(leg["strike"]), 4)] = leg
+
+                if message_count >= 80:
+                    break
+
+        except requests.RequestException as exc:
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": bool(legs_by_strike),
+                "message_count": message_count,
+                "note": str(exc)[:300],
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration") == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+                "leg_count": len(legs_by_strike),
+            })
+
+        for long_strike, long_leg in legs_by_strike.items():
+            long_abs_delta = safe_float(long_leg.get("abs_delta"))
+            if (
+                long_abs_delta is None
+                or not (long_delta_min <= long_abs_delta <= long_delta_max)
+                or safe_float(long_leg.get("spread_dollars"), 999.0) > max_leg_spread_dollars
+                or safe_float(long_leg.get("spread_pct"), 999.0) > max_leg_spread_pct
+                or safe_int(long_leg.get("open_interest"), 0) < min_open_interest
+            ):
+                continue
+
+            short_strike = (
+                long_strike + spread_width
+                if direction == "BULLISH"
+                else long_strike - spread_width
+            )
+            short_leg = legs_by_strike.get(round(short_strike, 4))
+            if short_leg is None:
+                continue
+            short_abs_delta = safe_float(short_leg.get("abs_delta"))
+            if (
+                short_abs_delta is None
+                or not (short_delta_min <= short_abs_delta <= short_delta_max)
+                or safe_float(short_leg.get("spread_dollars"), 999.0) > max_leg_spread_dollars
+                or safe_float(short_leg.get("spread_pct"), 999.0) > max_leg_spread_pct
+                or safe_int(short_leg.get("open_interest"), 0) < min_open_interest
+            ):
+                continue
+
+            net_delta = long_abs_delta - short_abs_delta
+            if not (net_delta_min <= net_delta <= net_delta_max):
+                continue
+
+            # Conservative executable debit: buy long at Ask, sell short at Bid.
+            net_debit = safe_float(long_leg.get("ask")) - safe_float(short_leg.get("bid"))
+            if net_debit <= 0 or net_debit > max_net_debit:
+                continue
+
+            max_loss_dollars = net_debit * 100.0 * quantity_spreads
+            max_profit_per_share = spread_width - net_debit
+            max_profit_dollars = max_profit_per_share * 100.0 * quantity_spreads
+            if (
+                max_loss_dollars > max_loss_dollars_allowed
+                or max_profit_dollars < min_max_profit_dollars
+            ):
+                continue
+            reward_risk = (
+                max_profit_dollars / max_loss_dollars
+                if max_loss_dollars > 0
+                else None
+            )
+            if reward_risk is None or reward_risk < min_reward_risk:
+                continue
+
+            long_theta = safe_float(long_leg.get("theta"))
+            short_theta = safe_float(short_leg.get("theta"))
+            if long_theta is None or short_theta is None:
+                continue
+            net_theta = long_theta - short_theta
+            theta_burden_pct = abs(net_theta) / net_debit * 100.0
+            if theta_burden_pct > max_theta_burden_pct:
+                continue
+
+            profit_exit_spread_price = net_debit + 0.50 * max_profit_per_share
+            protective_exit_spread_price = net_debit * 0.50
+            breakeven = (
+                long_strike + net_debit
+                if direction == "BULLISH"
+                else long_strike - net_debit
+            )
+
+
+            vertical_candidates.append({
+                "vertical_type": vertical_type,
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "long_leg": long_leg,
+                "short_leg": short_leg,
+                "spread_width": round(spread_width, 2),
+                "net_debit": round(net_debit, 4),
+                "cost_dollars": round(max_loss_dollars, 2),
+                "max_loss_dollars": round(max_loss_dollars, 2),
+                "max_profit_dollars": round(max_profit_dollars, 2),
+                "reward_risk": round(reward_risk, 4),
+                "net_delta": round(net_delta, 6),
+                "net_theta": round(net_theta, 6),
+                "theta_burden_pct": round(theta_burden_pct, 4),
+                "theta_gate": "YES",
+                "delta_gate": "YES",
+                "liquidity_gate": "YES",
+                "debit_gate": "YES",
+                "max_loss_gate": "YES",
+                "max_profit_gate": "YES",
+                "reward_risk_gate": "YES",
+                "breakeven": round(breakeven, 4),
+                "profit_exit_rule": "+50% OF MAXIMUM POSSIBLE PROFIT",
+                "profit_exit_spread_price": round(profit_exit_spread_price, 4),
+                "protective_exit_rule": "-50% OF ORIGINAL NET DEBIT",
+                "protective_exit_spread_price": round(protective_exit_spread_price, 4),
+                "time_exit_et": "15:45",
+                "quantity_spreads": quantity_spreads,
+                "delta_distance": round(abs(long_abs_delta - long_delta_mid), 8),
+            })
+
+    # Compare 1-DTE and 2-DTE qualified spreads. Reward:risk remains primary;
+    # 2-DTE is preferred when reward:risk is tied, then Delta closeness.
+    vertical_candidates.sort(
+        key=lambda item: (
+            -float(item["reward_risk"]),
+            0 if int(item["dte"]) == 2 else 1,
+            float(item["delta_distance"]),
+        )
+    )
+    selected_vertical = vertical_candidates[0] if vertical_candidates else None
+
+    vertical_contract_gate = "YES" if selected_vertical else "WAIT"
+    reward_risk_gate = (
+        "YES"
+        if selected_vertical
+        and float(selected_vertical.get("reward_risk", 0)) >= min_reward_risk
+        else "WAIT"
+    )
+
+    setup_ready = (
+        market_gate_ready
+        and entry_window_gate == "YES"
+        and vertical_contract_gate == "YES"
+        and reward_risk_gate == "YES"
+    )
+
+    decision = vertical_type if setup_ready else "WAIT"
+    approval_status = "READY FOR PROPOSAL" if setup_ready else "WAIT"
+
+    # Remove internal tie-break field from user-facing selected result.
+    if selected_vertical:
+        selected_vertical = dict(selected_vertical)
+        selected_vertical.pop("delta_distance", None)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "project": "QQQ_VERTICAL_V1",
+        "environment": "SIM",
+        "underlying": underlying,
+        "bar_timestamp": indicators.get("bar_timestamp", ""),
+        "qqq_close": indicators.get("qqq_close", ""),
+        "ema21": indicators.get("ema21", ""),
+        "vwap": indicators.get("vwap", ""),
+        "adx14": indicators.get("adx14", ""),
+        "zlema_state": zlema_state,
+        "zlema_confirm": zlema_confirm,
+        "direction": direction,
+        "vertical_type": vertical_type,
+        "decision": decision,
+        "approval_status": approval_status,
+        "selected_vertical": selected_vertical,
+        "qualified_vertical_count": len(vertical_candidates),
+        "gates": {
+            "trend_alignment": trend_alignment_gate,
+            "zlema_confirmation": zlema_confirmation_gate,
+            "adx": adx_gate,
+            "entry_window": entry_window_gate,
+            "vertical_contract": vertical_contract_gate,
+            "delta": "YES" if selected_vertical else "WAIT",
+            "liquidity": "YES" if selected_vertical else "WAIT",
+            "theta_burden": "YES" if selected_vertical else "WAIT",
+            "net_debit": "YES" if selected_vertical else "WAIT",
+            "max_loss": "YES" if selected_vertical else "WAIT",
+            "max_profit": "YES" if selected_vertical else "WAIT",
+            "reward_risk": reward_risk_gate,
+        },
+        "rules": {
+            "expiration_type": "Monthly or Weekly",
+            "allowed_dte": sorted(allowed_dte),
+            "long_abs_delta": [long_delta_min, long_delta_max],
+            "short_abs_delta": [short_delta_min, short_delta_max],
+            "net_delta": [net_delta_min, net_delta_max],
+            "short_leg_rule": "$2 away from long strike, same expiration",
+            "spread_width": spread_width,
+            "max_leg_spread_dollars": max_leg_spread_dollars,
+            "max_leg_spread_pct": max_leg_spread_pct,
+            "min_open_interest_each_leg": min_open_interest,
+            "max_theta_burden_pct": max_theta_burden_pct,
+            "net_debit_rule": ">$0 and <=$1.10",
+            "max_net_debit": max_net_debit,
+            "max_loss_dollars": max_loss_dollars_allowed,
+            "min_max_profit_dollars": min_max_profit_dollars,
+            "min_reward_risk": min_reward_risk,
+            "quantity_spreads": quantity_spreads,
+            "entry_window_et": "10:00-15:00",
+            "profit_exit": "+50% of maximum possible profit",
+            "protective_exit": "-50% of original net debit",
+            "time_exit_et": "15:45",
+            "hold_through_expiration": False,
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "stream_notes": stream_notes,
+        "safety": "READ ONLY - NO ORDER CAPABILITY IN THIS ROUTE",
+        "next_step": (
+            "Verify #10 selector output against TradeStation OptionStation Pro. "
+            "Do not add APPROVE/PASS or execution until validation is complete."
+        ),
+    }), 200
+
+
+
+# ==============================================================
+# #12 NVDA COVERED CALL V1 - FLAT SELECTED-CALL FEED / TIMEOUT SAFE
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+
+@app.get("/odts-nvda-covered-call-approval")
+def odts_nvda_covered_call_approval():
+    """
+    NVDA Covered Call V1 read-only approval document (#12 flat-feed, timeout-safe).
+
+    Frozen V1 rules:
+      - Underlying NVDA; 100 shares covered; 1 call contract
+      - SELL TO OPEN CALL (display only in this route)
+      - OTM strike only
+      - 7 to 21 calendar DTE
+      - absolute Delta 0.20 to 0.30
+      - IVX percentile gate:
+          <25 WAIT; 25-<50 CAUTION; 50-80 YES; >80 CAUTION/EVENT CHECK
+      - Premium return on current stock value:
+          >=1.00% YES; 0.60-<1.00% CAUTION; <0.60% WAIT
+      - Assignment strike above cost basis and acceptable sale price
+      - Event gate: no major event before expiry = YES; event = CAUTION;
+        IVX >80 plus event = WAIT
+      - Liquidity: <=10% spread YES; >10% to <=15% CAUTION; >15% rejected
+      - Volume and open interest are displayed, with no hard minimum in V1
+      - Final Decision: YES / CAUTION / WAIT
+      - Only YES may later become eligible for human APPROVE/PASS
+
+    Current implementation intentionally keeps IVX percentile and event status
+    as explicit approval inputs because the existing TradeStation feed in this
+    service does not provide a validated historical IVX-percentile series or an
+    earnings/event calendar.  Optional query inputs:
+      ?ivx_percentile=65
+      &event_before_expiration=NO
+      &cost_basis=210
+      &min_assignment_price=210
+
+
+    This route NEVER submits, modifies, cancels, or closes an order.
+    """
+    access_token, error = get_valid_access_token()
+
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    # ----------------------------------------------------------
+    # FROZEN V1 RULES / INPUTS
+    # ----------------------------------------------------------
+    underlying = "NVDA"
+    shares_covered = 100
+    contracts = 1
+    allowed_dte_min = 7
+    allowed_dte_max = 21
+    delta_min = 0.20
+    delta_max = 0.30
+    delta_mid = (delta_min + delta_max) / 2.0
+    preferred_spread_pct = 10.0
+    max_spread_pct = 15.0
+    premium_yes_pct = 1.00
+    premium_caution_pct = 0.60
+    # Restrict the TradeStation stream to the useful neighborhood around
+    # NVDA. The prior value of 40 produced an unnecessarily large stream and
+    # could exhaust the total scan deadline before every expiration finished.
+    # This changes scan efficiency only; every returned contract must still
+    # pass the same frozen DTE, Delta, premium, assignment and liquidity rules.
+    strike_proximity = 16
+    preferred_dte = 14
+
+    def safe_float(value, default=None):
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def safe_int(value, default=0):
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_expiration(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        for candidate in (raw, raw.replace("Z", "+00:00"), raw[:10]):
+            try:
+                return datetime.fromisoformat(candidate).date()
+            except Exception:
+                pass
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(raw[:10], fmt).date()
+            except Exception:
+                pass
+        return None
+
+    cost_basis = safe_float(request.args.get("cost_basis", "210"), 210.0)
+    min_assignment_price = safe_float(
+        request.args.get("min_assignment_price", str(cost_basis)),
+        cost_basis,
+    )
+    ivx_percentile = safe_float(request.args.get("ivx_percentile"), None)
+    event_raw = str(
+        request.args.get("event_before_expiration", "UNKNOWN")
+    ).strip().upper()
+    if event_raw in {"N", "FALSE", "0", "NONE"}:
+        event_raw = "NO"
+    elif event_raw in {"Y", "TRUE", "1"}:
+        event_raw = "YES"
+    if event_raw not in {"YES", "NO", "UNKNOWN"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "event_before_expiration must be YES, NO, or UNKNOWN",
+        }), 400
+
+    # ----------------------------------------------------------
+    # UNDERLYING QUOTE - READ ONLY
+    # ----------------------------------------------------------
+    quote_url = (
+        f"{TS_API_BASE_URL}/marketdata/stream/quotes/"
+        f"{requests.utils.quote(underlying, safe='')}"
+    )
+    quote_response = None
+    nvda_quote = {}
+    try:
+        quote_response = requests.get(
+            quote_url,
+            headers=ts_headers(access_token),
+            stream=True,
+            timeout=(3, 4),
+        )
+        if not quote_response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "approval_enabled": False,
+                "project": "NVDA_COVERED_CALL_V1",
+                "status_code": quote_response.status_code,
+                "response": quote_response.text[:1000],
+            }), quote_response.status_code
+
+        for line in quote_response.iter_lines():
+            if not line:
+                continue
+            raw = line.decode("utf-8", errors="replace").strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if item.get("StreamStatus") or item.get("Error"):
+                continue
+            nvda_quote = item
+            break
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": f"NVDA quote request failed: {exc}",
+        }), 502
+    finally:
+        if quote_response is not None:
+            try:
+                quote_response.close()
+            except Exception:
+                pass
+
+    stock_price = safe_float(nvda_quote.get("Last"))
+    if stock_price is None or stock_price <= 0:
+        stock_bid = safe_float(nvda_quote.get("Bid"))
+        stock_ask = safe_float(nvda_quote.get("Ask"))
+        if stock_bid is not None and stock_ask is not None:
+            stock_price = (stock_bid + stock_ask) / 2.0
+
+    if stock_price is None or stock_price <= 0:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "A valid NVDA stock price was not returned.",
+        }), 502
+
+    # ----------------------------------------------------------
+    # IVX GATE - EXPLICIT INPUT UNTIL A VALIDATED IVX FEED EXISTS
+    # ----------------------------------------------------------
+    ivx_gate = "WAIT"
+    ivx_note = "IVX percentile input required"
+    if ivx_percentile is not None:
+        if ivx_percentile < 0 or ivx_percentile > 100:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "approval_enabled": False,
+                "project": "NVDA_COVERED_CALL_V1",
+
+                "error": "ivx_percentile must be between 0 and 100",
+            }), 400
+        if ivx_percentile < 25:
+            ivx_gate = "WAIT"
+            ivx_note = "Low IVX percentile"
+        elif ivx_percentile < 50:
+            ivx_gate = "CAUTION"
+            ivx_note = "Normal IVX percentile"
+        elif ivx_percentile <= 80:
+            ivx_gate = "YES"
+            ivx_note = "Preferred elevated IVX zone"
+        else:
+            ivx_gate = "CAUTION"
+            ivx_note = "Very high IVX - event check required"
+
+    # ----------------------------------------------------------
+    # EXPIRATIONS - 7 TO 21 CALENDAR DTE
+    # ----------------------------------------------------------
+    expiration_url = f"{TS_API_BASE_URL}/marketdata/options/expirations/{underlying}"
+    try:
+        expiration_response = requests.get(
+            expiration_url,
+            headers=ts_headers(access_token),
+            timeout=8,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": f"NVDA expiration request failed: {exc}",
+        }), 502
+
+    if not expiration_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "status_code": expiration_response.status_code,
+            "response": expiration_response.text[:1000],
+        }), expiration_response.status_code
+
+    try:
+        expiration_body = expiration_response.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "error": "TradeStation expiration response was not valid JSON.",
+        }), 502
+
+    today_et = now_et().date()
+    expirations = (
+        expiration_body.get("Expirations", [])
+        if isinstance(expiration_body, dict)
+        else []
+    )
+    eligible_expirations = []
+    if isinstance(expirations, list):
+        for expiration_item in expirations:
+            if isinstance(expiration_item, dict):
+                raw_date = (
+                    expiration_item.get("Date")
+                    or expiration_item.get("ExpirationDate")
+                    or expiration_item.get("Expiration")
+                )
+                expiration_type = str(
+                    expiration_item.get("Type")
+                    or expiration_item.get("ExpirationType")
+                    or ""
+                ).strip()
+            else:
+                raw_date = expiration_item
+                expiration_type = ""
+
+            expiration_date = parse_expiration(raw_date)
+            if expiration_date is None:
+                continue
+            dte = (expiration_date - today_et).days
+            if allowed_dte_min <= dte <= allowed_dte_max:
+                eligible_expirations.append({
+                    "date": expiration_date,
+                    "dte": dte,
+                    "type": expiration_type,
+                })
+
+    # Inspect the expirations closest to the middle of the frozen 7-21 DTE
+    # window first. A partial scan remains approval-ineligible, but this makes
+    # the first read-only candidate more representative if TS responds slowly.
+    eligible_expirations.sort(
+        key=lambda item: (
+            abs(item["dte"] - preferred_dte),
+            item["dte"],
+            item["date"],
+        )
+    )
+
+    if not eligible_expirations:
+        return jsonify({
+            "ok": True,
+            "read_only": True,
+            "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "environment": "SIM",
+            "stock": underlying,
+            "stock_price": round(stock_price, 4),
+            "decision": "WAIT",
+            "approval_status": "WAIT",
+            "selected_call": None,
+            "error": "No NVDA expiration was found between 7 and 21 calendar DTE.",
+        }), 200
+
+    # ----------------------------------------------------------
+    # SCAN CALL CHAINS AND BUILD APPROVAL CANDIDATES
+    # ----------------------------------------------------------
+    chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+    candidates = []
+    stream_notes = []
+
+    # #11A reliability guardrails. These do not change the frozen trading
+    # rules; they only prevent a slow TradeStation stream from holding the
+    # HTTP request open indefinitely. A partial scan can DISPLAY candidates,
+    # but it can never return approval eligibility.
+    scan_started = time.monotonic()
+    scan_deadline_seconds = 20.0
+    max_messages_per_expiry = 80
+    scan_truncated = False
+    truncation_reason = ""
+
+    for expiry in eligible_expirations:
+        if time.monotonic() - scan_started >= scan_deadline_seconds:
+            scan_truncated = True
+            truncation_reason = "TOTAL_SCAN_DEADLINE"
+            break
+        expiration_date = expiry["date"]
+        chain_params = {
+            "expiration": expiration_date.strftime("%m-%d-%Y"),
+            "strikeProximity": strike_proximity,
+            "spreadType": "Single",
+            "enableGreeks": "true",
+            "optionType": "Call",
+        }
+
+        chain_response = None
+        message_count = 0
+        candidate_count_for_expiry = 0
+
+        try:
+            chain_response = requests.get(
+                chain_url,
+                headers=ts_headers(access_token),
+                params=chain_params,
+                stream=True,
+                timeout=(3, 3),
+            )
+            if not chain_response.ok:
+                stream_notes.append({
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "ok": False,
+                    "status_code": chain_response.status_code,
+                    "response": chain_response.text[:500],
+                })
+                continue
+
+            for line in chain_response.iter_lines():
+                if time.monotonic() - scan_started >= scan_deadline_seconds:
+                    scan_truncated = True
+                    truncation_reason = "TOTAL_SCAN_DEADLINE"
+                    break
+                if not line:
+                    continue
+
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+
+                if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                    break
+                if item.get("Error"):
+                    continue
+
+                message_count += 1
+                legs = item.get("Legs", [])
+                leg = (
+                    legs[0]
+                    if isinstance(legs, list)
+                    and legs
+                    and isinstance(legs[0], dict)
+                    else {}
+                )
+                option_type = str(
+                    item.get("Side") or leg.get("OptionType") or ""
+                ).strip().upper()
+                if option_type != "CALL":
+                    continue
+
+                strike = safe_float(leg.get("StrikePrice"))
+                if strike is None:
+                    strikes = item.get("Strikes", [])
+                    if isinstance(strikes, list) and strikes:
+                        strike = safe_float(strikes[0])
+                if strike is None or strike <= stock_price:
+                    continue
+
+                delta_raw = safe_float(item.get("Delta"))
+                if delta_raw is None:
+                    continue
+                abs_delta = abs(delta_raw)
+                if not (delta_min <= abs_delta <= delta_max):
+                    continue
+
+                bid = safe_float(item.get("Bid"))
+                ask = safe_float(item.get("Ask"))
+                if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+                    continue
+
+                mid = safe_float(item.get("Mid"))
+                if mid is None or mid <= 0:
+                    mid = (bid + ask) / 2.0
+                option_spread = ask - bid
+                spread_pct = (option_spread / mid) * 100.0 if mid > 0 else None
+                if spread_pct is None or spread_pct > max_spread_pct:
+                    continue
+
+                premium_credit_dollars = bid * 100.0 * contracts
+                stock_value = stock_price * shares_covered
+                premium_return_pct = (
+                    (premium_credit_dollars / stock_value) * 100.0
+                    if stock_value > 0
+                    else 0.0
+                )
+
+                if spread_pct <= preferred_spread_pct:
+                    liquidity_gate = "YES"
+                else:
+                    liquidity_gate = "CAUTION"
+
+                if premium_return_pct >= premium_yes_pct:
+                    premium_gate = "YES"
+                elif premium_return_pct >= premium_caution_pct:
+                    premium_gate = "CAUTION"
+                else:
+                    premium_gate = "WAIT"
+
+                assignment_gate = (
+                    "YES"
+                    if strike > cost_basis and strike >= min_assignment_price
+                    else "WAIT"
+                )
+
+                event_gate = "WAIT"
+                event_note = "Event status not supplied"
+                if event_raw == "NO":
+                    event_gate = "YES"
+                    event_note = "No major event before expiration"
+                elif event_raw == "YES":
+                    if ivx_percentile is not None and ivx_percentile > 80:
+                        event_gate = "WAIT"
+                        event_note = "Very high IVX plus major event"
+                    else:
+                        event_gate = "CAUTION"
+                        event_note = "Major event before expiration"
+
+                stock_gain_if_assigned = (strike - cost_basis) * shares_covered
+                total_gain_if_assigned = stock_gain_if_assigned + premium_credit_dollars
+                breakeven = cost_basis - bid
+                upside_to_strike_pct = ((strike / stock_price) - 1.0) * 100.0
+
+                gates = {
+                    "dte": "YES",
+                    "delta": "YES",
+                    "ivx": ivx_gate,
+                    "premium_return": premium_gate,
+                    "assignment": assignment_gate,
+                    "event": event_gate,
+                    "liquidity": liquidity_gate,
+                }
+
+                gate_values = list(gates.values())
+                if "WAIT" in gate_values:
+                    final_decision = "WAIT"
+                elif "CAUTION" in gate_values:
+                    final_decision = "CAUTION"
+                else:
+                    final_decision = "YES"
+
+                symbol = str(
+                    leg.get("Symbol") or item.get("Symbol") or ""
+                ).strip()
+                candidate = {
+                    "symbol": symbol,
+                    "option_type": "Call",
+                    "action": "SELL TO OPEN",
+                    "expiration": expiration_date.isoformat(),
+                    "dte": expiry["dte"],
+                    "strike": round(strike, 4),
+                    "delta": round(delta_raw, 6),
+                    "abs_delta": round(abs_delta, 6),
+                    "bid": round(bid, 4),
+                    "ask": round(ask, 4),
+                    "mid": round(mid, 4),
+                    "spread_pct": round(spread_pct, 4),
+                    "volume": safe_int(item.get("Volume"), 0),
+                    "open_interest": safe_int(item.get("DailyOpenInterest"), 0),
+                    "contract_implied_volatility": safe_float(
+                        item.get("ImpliedVolatility"), ""
+                    ),
+                    "premium_credit_dollars": round(premium_credit_dollars, 2),
+                    "premium_return_pct": round(premium_return_pct, 4),
+                    "breakeven_cost_basis_after_premium": round(breakeven, 4),
+                    "stock_gain_if_assigned_dollars": round(stock_gain_if_assigned, 2),
+                    "total_gain_if_assigned_dollars": round(total_gain_if_assigned, 2),
+                    "upside_to_strike_pct": round(upside_to_strike_pct, 4),
+                    "gates": gates,
+                    "decision": final_decision,
+                    "event_note": event_note,
+                    "delta_distance": round(abs(abs_delta - delta_mid), 8),
+                }
+                candidates.append(candidate)
+                candidate_count_for_expiry += 1
+
+                if message_count >= max_messages_per_expiry:
+                    break
+
+        except requests.RequestException as exc:
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": candidate_count_for_expiry > 0,
+                "message_count": message_count,
+                "note": str(exc)[:300],
+            })
+        finally:
+            if chain_response is not None:
+                try:
+                    chain_response.close()
+                except Exception:
+                    pass
+
+        if not any(
+            note.get("expiration") == expiration_date.isoformat()
+            for note in stream_notes
+        ):
+            stream_notes.append({
+                "expiration": expiration_date.isoformat(),
+                "dte": expiry["dte"],
+                "ok": True,
+                "message_count": message_count,
+
+                "candidate_count": candidate_count_for_expiry,
+            })
+
+        if scan_truncated:
+            break
+
+    scan_elapsed_seconds = round(time.monotonic() - scan_started, 3)
+
+    # Rank YES first, then CAUTION, then WAIT; within each bucket prefer
+    # premium return, tighter spread, and Delta closest to midpoint.
+    decision_rank = {"YES": 0, "CAUTION": 1, "WAIT": 2}
+    candidates.sort(
+        key=lambda item: (
+            decision_rank.get(item.get("decision"), 9),
+            -float(item.get("premium_return_pct", 0.0)),
+            float(item.get("spread_pct", 999.0)),
+            float(item.get("delta_distance", 999.0)),
+            int(item.get("dte", 999)),
+        )
+    )
+    selected_call = dict(candidates[0]) if candidates else None
+    if selected_call:
+        selected_call.pop("delta_distance", None)
+
+    candidate_decision = selected_call.get("decision") if selected_call else "WAIT"
+    final_decision = candidate_decision
+    if scan_truncated:
+        # Safety: a partial option-chain scan is never approval-eligible.
+        final_decision = "WAIT"
+        approval_status = "WAIT - PARTIAL CHAIN SCAN"
+    else:
+        approval_status = (
+            "ELIGIBLE FOR HUMAN APPROVE/PASS"
+            if final_decision == "YES"
+            else final_decision
+        )
+
+    # Approval remains disabled in #11. This document can only display the
+    # future approval eligibility state; it has no order-capable function.
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "project": "NVDA_COVERED_CALL_V1",
+        "environment": "SIM",
+        "stock": underlying,
+        "shares_covered": shares_covered,
+        "contracts": contracts,
+        "stock_price": round(stock_price, 4),
+        "cost_basis_per_share": round(cost_basis, 4),
+        "minimum_acceptable_assignment_price": round(min_assignment_price, 4),
+        "ivx_percentile": (
+            round(ivx_percentile, 4) if ivx_percentile is not None else ""
+        ),
+        "ivx_gate": ivx_gate,
+        "ivx_note": ivx_note,
+        "event_before_expiration": event_raw,
+        "decision": final_decision,
+        "candidate_decision": candidate_decision,
+        "approval_status": approval_status,
+        "scan_complete": not scan_truncated,
+        "scan_truncated": scan_truncated,
+        "scan_truncation_reason": truncation_reason,
+        "scan_elapsed_seconds": scan_elapsed_seconds,
+        "scan_limits": {
+            "total_deadline_seconds": scan_deadline_seconds,
+            "max_messages_per_expiry": max_messages_per_expiry,
+            "strike_proximity": strike_proximity,
+            "preferred_dte": preferred_dte,
+            "chain_connect_timeout_seconds": 3,
+            "chain_read_timeout_seconds": 3,
+        },
+        "selected_call": selected_call,
+
+        # #12 Excel-friendly flattened selected-call fields.
+        # These duplicate the same READ-ONLY selected_call values above so
+        # Excel/Power Query can consume them directly without expanding a
+        # nested JSON Record. No order capability is added by these fields.
+        "selected_call_symbol": (
+            selected_call.get("symbol", "") if selected_call else ""
+        ),
+        "selected_call_option_type": (
+            selected_call.get("option_type", "") if selected_call else ""
+        ),
+        "selected_call_action": (
+            selected_call.get("action", "") if selected_call else ""
+        ),
+        "selected_call_expiration": (
+            selected_call.get("expiration", "") if selected_call else ""
+        ),
+        "selected_call_dte": (
+            selected_call.get("dte", "") if selected_call else ""
+        ),
+        "selected_call_strike": (
+            selected_call.get("strike", "") if selected_call else ""
+        ),
+        "selected_call_delta": (
+            selected_call.get("delta", "") if selected_call else ""
+        ),
+        "selected_call_abs_delta": (
+            selected_call.get("abs_delta", "") if selected_call else ""
+        ),
+        "selected_call_bid": (
+            selected_call.get("bid", "") if selected_call else ""
+        ),
+        "selected_call_ask": (
+            selected_call.get("ask", "") if selected_call else ""
+        ),
+        "selected_call_mid": (
+            selected_call.get("mid", "") if selected_call else ""
+        ),
+        "selected_call_spread_pct": (
+            selected_call.get("spread_pct", "") if selected_call else ""
+        ),
+        "selected_call_volume": (
+            selected_call.get("volume", "") if selected_call else ""
+        ),
+        "selected_call_open_interest": (
+            selected_call.get("open_interest", "") if selected_call else ""
+        ),
+        "selected_call_contract_iv": (
+            selected_call.get("contract_implied_volatility", "")
+            if selected_call else ""
+        ),
+        "selected_call_premium_credit_dollars": (
+            selected_call.get("premium_credit_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_premium_return_pct": (
+            selected_call.get("premium_return_pct", "")
+            if selected_call else ""
+        ),
+        "selected_call_breakeven": (
+            selected_call.get("breakeven_cost_basis_after_premium", "")
+            if selected_call else ""
+        ),
+        "selected_call_stock_gain_if_assigned_dollars": (
+            selected_call.get("stock_gain_if_assigned_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_total_gain_if_assigned_dollars": (
+            selected_call.get("total_gain_if_assigned_dollars", "")
+            if selected_call else ""
+        ),
+        "selected_call_upside_to_strike_pct": (
+            selected_call.get("upside_to_strike_pct", "")
+            if selected_call else ""
+        ),
+        "selected_call_decision": (
+            selected_call.get("decision", "") if selected_call else ""
+        ),
+        "selected_call_event_note": (
+            selected_call.get("event_note", "") if selected_call else ""
+        ),
+
+        "qualified_contract_count": len(candidates),
+        "rules": {
+            "position": "100 NVDA shares covered by 1 call",
+            "action": "SELL TO OPEN CALL",
+            "otm_only": True,
+            "allowed_dte": [allowed_dte_min, allowed_dte_max],
+            "abs_delta": [delta_min, delta_max],
+            "ivx_percentile": {
+                "below_25": "WAIT",
+                "25_to_below_50": "CAUTION",
+                "50_to_80": "YES",
+                "above_80": "CAUTION / EVENT CHECK",
+            },
+            "premium_return_pct": {
+                "yes": ">=1.00%",
+                "caution": "0.60% to <1.00%",
+                "wait": "<0.60%",
+            },
+            "assignment": "Strike must be above cost basis and acceptable sale price",
+            "event": "No event=YES; event=CAUTION; IVX>80 + event=WAIT",
+            "liquidity": {
+                "preferred": "<=10% Bid/Ask spread",
+                "caution": ">10% to <=15%",
+                "wait": ">15% or invalid quote",
+
+            },
+            "volume_open_interest": "DISPLAY ONLY - NO HARD V1 MINIMUM",
+            "human_control": "APPROVE / PASS only after a future execution phase",
+        },
+        "eligible_expirations": [
+            {
+                "date": item["date"].isoformat(),
+                "dte": item["dte"],
+                "type": item["type"],
+            }
+            for item in eligible_expirations
+        ],
+        "stream_notes": stream_notes,
+        "safety": "READ ONLY - NO COVERED CALL ORDER CAPABILITY IN #12",
+        "input_note": (
+            "Until a validated automatic IVX-percentile and event-calendar feed is "
+            "connected, supply ivx_percentile and event_before_expiration in the URL."
+        ),
+        "example_url_suffix": (
+            "/odts-nvda-covered-call-approval?ivx_percentile=65"
+            "&event_before_expiration=NO&cost_basis=210&min_assignment_price=210"
+        ),
+        "next_step": (
+            "Validate #12 flat selected-call output against the live NVDA option chain. "
+            "Do not add covered-call execution until the approval document is verified."
+        ),
+    }), 200
+
+
+# ==============================================================
+# #13 NVDA COVERED CALL V1 - TRADESTATION SIM CONFIRMATION
+# HUMAN APPROVE / PASS / CONFIRMATION ONLY / NEVER SUBMITS
+# ==============================================================
+
+NVDA_COVERED_CALL_SIM_API_BASE_URL = "https://sim-api.tradestation.com/v3"
+
+
+def _nvda_covered_call_snapshot():
+    """Return the current #12 read-only approval document as a plain dict."""
+    response = odts_nvda_covered_call_approval()
+
+    status_code = 200
+    if isinstance(response, tuple):
+        flask_response = response[0]
+        if len(response) > 1:
+            status_code = int(response[1])
+    else:
+        flask_response = response
+        status_code = int(getattr(flask_response, "status_code", 200))
+
+    try:
+        payload = flask_response.get_json()
+    except Exception:
+        payload = None
+
+    if status_code >= 400 or not isinstance(payload, dict):
+        return False, {
+            "error": "NVDA covered-call selector did not return a usable response.",
+            "status_code": status_code,
+        }
+
+    if not payload.get("ok"):
+        return False, payload
+
+    return True, payload
+
+
+def _nvda_sim_share_position(access_token):
+    """Read the exact NVDA share position from TradeStation SIM."""
+    if not TS_SIM_ACCOUNT_ID:
+        return False, 0.0, {"error": "TS_SIM_ACCOUNT_ID is missing."}
+
+    url = (
+        f"{NVDA_COVERED_CALL_SIM_API_BASE_URL}/brokerage/accounts/"
+        f"{TS_SIM_ACCOUNT_ID}/positions"
+    )
+    try:
+        response = requests.get(
+            url,
+            headers=ts_headers(access_token),
+            params={"symbol": "NVDA"},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return False, 0.0, {
+            "error": f"NVDA SIM position request failed: {exc}"
+        }
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"raw_response": response.text[:1500]}
+
+    if not response.ok:
+        return False, 0.0, {
+            "status_code": response.status_code,
+            "response": body,
+        }
+
+    positions = body.get("Positions", []) if isinstance(body, dict) else []
+    if not isinstance(positions, list):
+        positions = []
+
+    for position in positions:
+        symbol = str(position.get("Symbol") or "").strip().upper()
+        if symbol != "NVDA":
+            continue
+
+        raw_qty = position.get("Quantity")
+        if raw_qty in (None, ""):
+            raw_qty = position.get("LongQuantity")
+        try:
+            quantity = float(raw_qty or 0)
+        except (TypeError, ValueError):
+            quantity = 0.0
+
+        long_short = str(position.get("LongShort") or "").strip().upper()
+        if long_short == "SHORT":
+            quantity = -abs(quantity)
+        return True, quantity, body
+
+    return True, 0.0, body
+
+
+@app.get("/odts-nvda-covered-call-sim-preview-status")
+def odts_nvda_covered_call_sim_preview_status():
+    return jsonify({
+        "ok": True,
+        "project": "NVDA_COVERED_CALL_V1",
+        "phase": "13_SIM_CONFIRMATION_ONLY",
+        "authenticated": bool(token_store.get("access_token")),
+        "sim_account_configured": bool(TS_SIM_ACCOUNT_ID),
+        "sim_api_base": NVDA_COVERED_CALL_SIM_API_BASE_URL,
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "allowed_decisions": ["APPROVE", "PASS"],
+        "required_position": "Long at least 100 NVDA shares in TradeStation SIM",
+        "next_step": (
+            "Use /odts-nvda-covered-call-sim-preview with decision=APPROVE "
+            "or decision=PASS and the current IVX/event inputs."
+        ),
+        "safety": (
+            "Confirmation only. This phase has no call to "
+            "/orderexecution/orders."
+        ),
+    }), 200
+
+
+@app.get("/odts-nvda-covered-call-sim-preview")
+def odts_nvda_covered_call_sim_preview():
+    """
+    Revalidate the current NVDA covered-call candidate and ask TradeStation SIM
+    for an order confirmation. This route never submits an order.
+    """
+    decision = str(request.args.get("decision") or "").strip().upper()
+    if decision not in {"APPROVE", "PASS"}:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "decision must be APPROVE or PASS",
+        }), 400
+
+    if decision == "PASS":
+        return jsonify({
+            "ok": True,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "decision": "PASS",
+            "read_only": True,
+            "order_sent": False,
+            "result": "PASSED - NO CONFIRMATION AND NO ORDER",
+            "safety": "No TradeStation order or confirmation function was called.",
+        }), 200
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    snapshot_ok, snapshot = _nvda_covered_call_snapshot()
+    if not snapshot_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Current NVDA covered-call revalidation failed.",
+            "detail": snapshot,
+        }), 409
+
+    if snapshot.get("environment") != "SIM":
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: current NVDA covered-call environment is not SIM.",
+        }), 403
+
+    if snapshot.get("scan_complete") is not True:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "decision": "APPROVE",
+            "result": "BLOCKED - OPTION CHAIN SCAN INCOMPLETE",
+        }), 409
+
+    if str(snapshot.get("decision") or "").strip().upper() != "YES":
+        return jsonify({
+            "ok": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "decision": "APPROVE",
+            "system_decision": snapshot.get("decision"),
+            "approval_status": snapshot.get("approval_status"),
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - SYSTEM DECISION IS NOT YES",
+            "gates": (snapshot.get("selected_call") or {}).get("gates"),
+        }), 409
+
+    selected = snapshot.get("selected_call")
+    if not isinstance(selected, dict):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: no selected NVDA call is available.",
+        }), 409
+
+    option_symbol = str(selected.get("symbol") or "").strip()
+    option_type = str(selected.get("option_type") or "").strip().upper()
+    action = str(selected.get("action") or "").strip().upper()
+    try:
+        contracts = int(snapshot.get("contracts") or 0)
+        shares_covered = int(snapshot.get("shares_covered") or 0)
+        bid = round(float(selected.get("bid")), 2)
+        spread_pct = float(selected.get("spread_pct"))
+        abs_delta = float(selected.get("abs_delta"))
+        dte = int(selected.get("dte"))
+        strike = float(selected.get("strike"))
+        stock_price = float(snapshot.get("stock_price"))
+        cost_basis = float(snapshot.get("cost_basis_per_share"))
+        minimum_assignment = float(
+            snapshot.get("minimum_acceptable_assignment_price")
+        )
+    except (TypeError, ValueError):
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Blocked: selected NVDA call contains invalid values.",
+        }), 409
+
+    frozen_gate_errors = []
+    if not option_symbol.upper().startswith("NVDA"):
+        frozen_gate_errors.append("Option symbol is not NVDA.")
+    if option_type != "CALL":
+        frozen_gate_errors.append("Selected option is not a call.")
+    if action != "SELL TO OPEN":
+        frozen_gate_errors.append("Selected action is not SELL TO OPEN.")
+    if contracts != 1 or shares_covered != 100:
+        frozen_gate_errors.append("Position must be 100 shares covered by 1 call.")
+    if not 7 <= dte <= 21:
+        frozen_gate_errors.append("DTE moved outside 7-21.")
+    if not 0.20 <= abs_delta <= 0.30:
+        frozen_gate_errors.append("Delta moved outside 0.20-0.30.")
+    if bid <= 0:
+        frozen_gate_errors.append("Bid is not positive.")
+    if spread_pct > 15.0:
+        frozen_gate_errors.append("Bid/Ask spread exceeds 15%.")
+    if strike <= stock_price:
+        frozen_gate_errors.append("Strike is not OTM.")
+    if strike <= cost_basis or strike < minimum_assignment:
+        frozen_gate_errors.append("Strike does not satisfy assignment-price rules.")
+
+    if frozen_gate_errors:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - FROZEN GATE REVALIDATION FAILED",
+            "errors": frozen_gate_errors,
+        }), 409
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    position_ok, nvda_quantity, position_detail = _nvda_sim_share_position(
+        access_token
+    )
+    if not position_ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TradeStation SIM NVDA position check failed.",
+            "detail": position_detail,
+        }), 502
+
+    if nvda_quantity < 100:
+        return jsonify({
+            "ok": False,
+            "project": "NVDA_COVERED_CALL_V1",
+            "phase": "13_SIM_CONFIRMATION_ONLY",
+            "environment": "SIM",
+            "read_only": True,
+            "order_sent": False,
+            "result": "BLOCKED - INSUFFICIENT NVDA SHARES IN SIM",
+            "required_nvda_shares": 100,
+            "sim_nvda_shares": nvda_quantity,
+        }), 409
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "Symbol": option_symbol,
+        "Quantity": "1",
+        "OrderType": "Limit",
+        "LimitPrice": f"{bid:.2f}",
+        "TradeAction": "SELLTOOPEN",
+        "TimeInForce": {"Duration": "DAY"},
+        "Route": "Intelligent",
+    }
+
+    try:
+        response = requests.post(
+            f"{NVDA_COVERED_CALL_SIM_API_BASE_URL}/orderexecution/orderconfirm",
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    return jsonify({
+        "ok": response.ok,
+        "project": "NVDA_COVERED_CALL_V1",
+        "phase": "13_SIM_CONFIRMATION_ONLY",
+        "environment": "SIM",
+        "decision": "APPROVE",
+        "system_decision": snapshot.get("decision"),
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_nvda_shares": nvda_quantity,
+        "selected_call": selected,
+        "confirmed_order": order,
+        "trade_station_status_code": response.status_code,
+        "trade_station_confirmation": ts_body,
+        "result": (
+            "TRADESTATION SIM CONFIRMATION RECEIVED - NO ORDER"
+            if response.ok else
+            "TRADESTATION SIM CONFIRMATION FAILED - NO ORDER"
+        ),
+        "safety": (
+            "Confirmation only. This route never calls "
+            "/orderexecution/orders and cannot place, replace, cancel, or close "
+            "an order."
+        ),
+    }), 200 if response.ok else 502
+
+# ==============================================================
+# START SERVER
+# ==============================================================
+
+
+
+# ==============================================================
+# #14 NVDA EULERPOOL IV PERCENTILE CONNECTION TEST
+# READ ONLY / NO ORDER SUBMISSION / NO EXISTING LOGIC CHANGED
+# ==============================================================
+@app.get("/odts-nvda-eulerpool-iv-percentile-test")
+def odts_nvda_eulerpool_iv_percentile_test():
+    """
+    Diagnostic-only test of the Eulerpool IV Rank / IV Percentile endpoint.
+
+    Safety:
+    - Reads EULERPOOL_API_KEY only from Render environment variables.
+    - Never returns the API key.
+    - Does not call TradeStation order functions.
+    - Does not alter the existing covered-call approval endpoint.
+    - Does not alter SOXL or QQQ logic.
+    """
+    api_key = os.getenv("EULERPOOL_API_KEY", "").strip()
+    symbol = "NVDA"
+    url = f"https://api.eulerpool.com/v1/volatility/{symbol}/iv-rank"
+
+    if not api_key:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": False,
+            "error": "EULERPOOL_API_KEY is not configured in Render.",
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), 500
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": "ZeroLag-AutoTrader-V/ODTS-NVDA-IV-Test"
+            },
+            timeout=(5, 10)
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": True,
+            "error": f"Eulerpool request failed: {exc}",
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), 502
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if not response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "NVDA_COVERED_CALL",
+            "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+            "symbol": symbol,
+            "api_key_configured": True,
+            "status_code": response.status_code,
+            "provider_response": (
+                body if body is not None else response.text[:1000]
+            ),
+            "safety": "READ ONLY diagnostic. No TradeStation or other order function is called."
+        }), response.status_code
+
+    def find_iv_fields(value, path=""):
+        found = {}
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                normalized = "".join(
+                    ch for ch in str(key).lower() if ch.isalnum()
+                )
+                if (
+                    "ivpercentile" in normalized
+                    or "impliedvolatilitypercentile" in normalized
+                    or "ivrank" in normalized
+                    or "impliedvolatilityrank" in normalized
+                ):
+                    found[child_path] = child
+                found.update(find_iv_fields(child, child_path))
+        elif isinstance(value, list):
+            for index, child in enumerate(value[:25]):
+                child_path = f"{path}[{index}]"
+                found.update(find_iv_fields(child, child_path))
+        return found
+
+    discovered = find_iv_fields(body)
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "project": "NVDA_COVERED_CALL",
+        "test": "EULERPOOL_IV_PERCENTILE_CONNECTION",
+        "provider": "Eulerpool",
+        "symbol": symbol,
+        "api_key_configured": True,
+        "status_code": response.status_code,
+        "iv_percentile_or_rank_fields_found": bool(discovered),
+        "discovered_iv_fields": discovered,
+        "provider_payload": body,
+        "next_interpretation": (
+            "Connection succeeded. Validate the exact IV Percentile field, value, "
+            "scale, and meaning against the TradeStation OptionStation display "
+            "before connecting it to the covered-call approval gate."
+        ),
+        "safety": (
+            "READ ONLY diagnostic. Existing NVDA covered-call approval, QQQ, "
+            "SOXL, and all order functions are unchanged."
+        )
+    }), 200
+
+
+# ==============================================================
+# UNIVERSAL OPTIONS SIM LAB V1 - PHASE 2
+# SIM ORDER CONFIRMATION ONLY / NEVER SUBMITS AN ORDER
+# ==============================================================
+
+UNIVERSAL_OPTIONS_SIM_API_BASE_URL = "https://sim-api.tradestation.com/v3"
+UNIVERSAL_OPTIONS_ALLOWED_ACTIONS = {
+    "BUYTOOPEN",
+    "SELLTOOPEN",
+    "BUYTOCLOSE",
+    "SELLTOCLOSE",
+}
+UNIVERSAL_OPTIONS_ALLOWED_PRICE_EFFECTS = {"DEBIT", "CREDIT"}
+
+
+def _universal_positive_number(value, field_name, allow_zero=False):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be numeric.")
+
+    minimum_ok = number >= 0 if allow_zero else number > 0
+    if not minimum_ok:
+        comparison = "zero or greater" if allow_zero else "greater than zero"
+        raise ValueError(f"{field_name} must be {comparison}.")
+    return number
+
+
+def _build_universal_sim_confirmation(payload):
+    """Validate an Excel/API request and build one SIM confirmation payload."""
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be one JSON object.")
+
+    strategy_name = str(payload.get("strategy_name") or "").strip().upper()
+    underlying = str(payload.get("underlying") or "").strip().upper()
+    price_effect = str(payload.get("price_effect") or "").strip().upper()
+    legs = payload.get("legs")
+
+    if not strategy_name:
+        raise ValueError("strategy_name is required.")
+    if not underlying or not underlying.replace(".", "").isalnum():
+        raise ValueError("underlying is required and must be a ticker symbol.")
+    if price_effect not in UNIVERSAL_OPTIONS_ALLOWED_PRICE_EFFECTS:
+        raise ValueError("price_effect must be DEBIT or CREDIT.")
+    if not isinstance(legs, list) or not 2 <= len(legs) <= 4:
+        raise ValueError("legs must contain exactly 2, 3, or 4 option legs.")
+
+    contracts_number = _universal_positive_number(
+        payload.get("contracts", 1), "contracts"
+    )
+    if not contracts_number.is_integer() or contracts_number > 10:
+        raise ValueError("contracts must be a whole number from 1 through 10.")
+    contracts = int(contracts_number)
+
+    net_price = round(
+        _universal_positive_number(payload.get("net_price"), "net_price"),
+        2,
+    )
+    max_loss_dollars = round(
+        _universal_positive_number(
+            payload.get("max_loss_dollars"), "max_loss_dollars"
+        ),
+        2,
+    )
+    max_capital_dollars = round(
+        _universal_positive_number(
+            payload.get("max_capital_dollars"), "max_capital_dollars"
+        ),
+        2,
+    )
+    if max_loss_dollars > max_capital_dollars:
+        raise ValueError(
+            "Blocked: max_loss_dollars exceeds max_capital_dollars."
+        )
+
+    expirations = set()
+    order_legs = []
+    normalized_legs = []
+    for index, leg in enumerate(legs, start=1):
+        if not isinstance(leg, dict):
+            raise ValueError(f"leg {index} must be a JSON object.")
+
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        expiration = str(leg.get("expiration") or "").strip()
+        trade_action = str(leg.get("trade_action") or "").strip().upper()
+        ratio_number = _universal_positive_number(
+            leg.get("ratio", 1), f"leg {index} ratio"
+        )
+
+        if not symbol or not symbol.startswith(underlying):
+            raise ValueError(
+                f"leg {index} symbol must be copied from TradeStation and "
+                f"must begin with {underlying}."
+            )
+        if trade_action not in UNIVERSAL_OPTIONS_ALLOWED_ACTIONS:
+            raise ValueError(
+                f"leg {index} trade_action must be BUYTOOPEN, SELLTOOPEN, "
+                "BUYTOCLOSE, or SELLTOCLOSE."
+            )
+        if not ratio_number.is_integer() or ratio_number > 10:
+            raise ValueError(f"leg {index} ratio must be a whole number from 1 to 10.")
+        if not expiration:
+            raise ValueError(f"leg {index} expiration is required (YYYY-MM-DD).")
+        try:
+            datetime.strptime(expiration, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"leg {index} expiration must use YYYY-MM-DD.")
+
+        ratio = int(ratio_number)
+        quantity = ratio * contracts
+        expirations.add(expiration)
+        order_legs.append({
+            "Symbol": symbol,
+            "Quantity": str(quantity),
+            "TradeAction": trade_action,
+        })
+        normalized_legs.append({
+            "leg": index,
+            "symbol": symbol,
+            "expiration": expiration,
+            "ratio": ratio,
+            "quantity": quantity,
+            "trade_action": trade_action,
+        })
+
+    if len(expirations) != 1:
+        raise ValueError(
+            "Blocked: TradeStation native multi-leg confirmation requires all "
+            "legs to use the same expiration. Double Calendars remain available "
+            "for Excel analysis only until TradeStation confirms a safe native "
+            "mixed-expiration order format."
+        )
+
+    order = {
+        "AccountID": TS_SIM_ACCOUNT_ID,
+        "OrderType": "Limit",
+        "LimitPrice": f"{net_price:.2f}",
+        "TimeInForce": {"Duration": "DAY"},
+        "Route": "Intelligent",
+        "Legs": order_legs,
+    }
+    return {
+        "strategy_name": strategy_name,
+        "underlying": underlying,
+        "contracts": contracts,
+        "price_effect": price_effect,
+        "net_price": net_price,
+        "max_loss_dollars": max_loss_dollars,
+        "max_capital_dollars": max_capital_dollars,
+        "expiration": next(iter(expirations)),
+        "legs": normalized_legs,
+        "order": order,
+    }
+
+
+@app.get("/universal-options-sim-preview-status")
+def universal_options_sim_preview_status():
+    return jsonify({
+        "ok": True,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_PREVIEW_ONLY",
+        "authenticated": bool(token_store.get("access_token")),
+        "sim_account_configured": bool(TS_SIM_ACCOUNT_ID),
+        "api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "supported_now": [
+            "VERTICAL",
+            "BUTTERFLY",
+            "IRON_CONDOR",
+            "CUSTOM_2_TO_4_LEG_SAME_EXPIRATION",
+        ],
+        "analysis_only_now": ["CALENDAR", "DOUBLE_CALENDAR"],
+        "next_step": "POST validated JSON to /universal-options-sim-preview.",
+    }), 200
+
+
+@app.post("/universal-options-sim-preview")
+def universal_options_sim_preview():
+    """
+    Ask TradeStation SIM to confirm/estimate one same-expiration spread.
+    This route deliberately has no call to /orderexecution/orders.
+    """
+    if not request.is_json:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "Content-Type must be application/json.",
+        }), 415
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    try:
+        confirmation = _build_universal_sim_confirmation(
+            request.get_json(silent=False)
+        )
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": str(exc),
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    confirm_url = (
+        f"{UNIVERSAL_OPTIONS_SIM_API_BASE_URL}/orderexecution/orderconfirm"
+    )
+    try:
+        response = requests.post(
+            confirm_url,
+            headers=ts_headers(access_token),
+            json=confirmation["order"],
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+            "validated_input": {
+                key: value for key, value in confirmation.items() if key != "order"
+            },
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    result = {
+        "ok": response.ok,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_PREVIEW_ONLY",
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "trade_station_status_code": response.status_code,
+        "validated_input": {
+            key: value for key, value in confirmation.items() if key != "order"
+        },
+        "trade_station_confirmation": ts_body,
+        "safety": (
+            "CONFIRMATION ONLY. This route cannot place, replace, cancel, "
+            "or close an order."
+        ),
+    }
+    return jsonify(result), 200 if response.ok else 502
+
+
+@app.get("/universal-options-sim-preview-link")
+def universal_options_sim_preview_link():
+    """Excel-friendly GET wrapper for SIM confirmation only; never submits."""
+    leg_count_text = str(request.args.get("leg_count") or "").strip()
+    try:
+        leg_count = int(leg_count_text)
+    except ValueError:
+        leg_count = 0
+
+    legs = []
+    for index in range(1, leg_count + 1):
+        legs.append({
+            "symbol": request.args.get(f"leg{index}_symbol"),
+            "expiration": request.args.get(f"leg{index}_expiration"),
+            "ratio": request.args.get(f"leg{index}_ratio", "1"),
+            "trade_action": request.args.get(f"leg{index}_action"),
+        })
+
+    payload = {
+        "strategy_name": request.args.get("strategy_name"),
+        "underlying": request.args.get("underlying"),
+        "contracts": request.args.get("contracts", "1"),
+        "price_effect": request.args.get("price_effect"),
+        "net_price": request.args.get("net_price"),
+        "max_loss_dollars": request.args.get("max_loss_dollars"),
+        "max_capital_dollars": request.args.get("max_capital_dollars"),
+        "legs": legs,
+    }
+
+    if not TS_SIM_ACCOUNT_ID:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": "TS_SIM_ACCOUNT_ID is missing.",
+        }), 503
+
+    try:
+        confirmation = _build_universal_sim_confirmation(payload)
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": str(exc),
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": error,
+            "next_step": "Open /login and authenticate TradeStation.",
+        }), 401
+
+    try:
+        response = requests.post(
+            f"{UNIVERSAL_OPTIONS_SIM_API_BASE_URL}/orderexecution/orderconfirm",
+            headers=ts_headers(access_token),
+            json=confirmation["order"],
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "error": f"TradeStation SIM confirmation request failed: {exc}",
+        }), 502
+
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+
+    return jsonify({
+        "ok": response.ok,
+        "project": "UNIVERSAL_OPTIONS_SIM_LAB_V1",
+        "phase": "2_EXCEL_LINK_PREVIEW_ONLY",
+        "read_only": True,
+        "order_sent": False,
+        "submit_endpoint_present": False,
+        "sim_api_base": UNIVERSAL_OPTIONS_SIM_API_BASE_URL,
+        "trade_station_status_code": response.status_code,
+        "validated_input": {
+            key: value for key, value in confirmation.items() if key != "order"
+        },
+        "trade_station_confirmation": ts_body,
+        "safety": "CONFIRMATION ONLY. No order can be submitted by this link.",
+    }), 200 if response.ok else 502
+
+
+# ==============================================================
+# QQQ STAGE 1 HISTORICAL DIRECTION STUDY
+# READ ONLY / UNDERLYING BARS ONLY / NO OPTION DATA / NO ORDERS
+# ==============================================================
+
+def _qqq_history_number(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _qqq_history_median(values):
+    clean = sorted(float(value) for value in values if value is not None)
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
+def _qqq_history_average(values):
+    clean = [float(value) for value in values if value is not None]
+    return (sum(clean) / len(clean)) if clean else None
+
+
+def _qqq_history_ema_series(values, length):
+    if not values:
+        return []
+    alpha = 2.0 / (float(length) + 1.0)
+    result = [float(values[0])]
+    for value in values[1:]:
+        result.append(
+            alpha * float(value) + (1.0 - alpha) * result[-1]
+        )
+    return result
+
+
+def _qqq_history_adx_series(highs, lows, closes, length=14):
+    """Return a Wilder ADX series aligned to the input bars."""
+    count = len(closes)
+    result = [None] * count
+    if count < (length * 2 + 1):
+        return result
+
+    tr = [0.0] * count
+    plus_dm = [0.0] * count
+    minus_dm = [0.0] * count
+
+    for index in range(1, count):
+        tr[index] = max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        )
+        up_move = highs[index] - highs[index - 1]
+        down_move = lows[index - 1] - lows[index]
+        plus_dm[index] = (
+            up_move if up_move > down_move and up_move > 0 else 0.0
+        )
+        minus_dm[index] = (
+            down_move if down_move > up_move and down_move > 0 else 0.0
+        )
+
+    atr = [None] * count
+    plus_smoothed = [None] * count
+    minus_smoothed = [None] * count
+    seed_index = length
+    atr[seed_index] = sum(tr[1:seed_index + 1]) / float(length)
+    plus_smoothed[seed_index] = (
+        sum(plus_dm[1:seed_index + 1]) / float(length)
+    )
+    minus_smoothed[seed_index] = (
+        sum(minus_dm[1:seed_index + 1]) / float(length)
+    )
+
+    for index in range(seed_index + 1, count):
+        atr[index] = (
+            atr[index - 1] * (length - 1) + tr[index]
+        ) / float(length)
+        plus_smoothed[index] = (
+            plus_smoothed[index - 1] * (length - 1) + plus_dm[index]
+        ) / float(length)
+        minus_smoothed[index] = (
+            minus_smoothed[index - 1] * (length - 1) + minus_dm[index]
+        ) / float(length)
+
+    dx = [None] * count
+    for index in range(seed_index, count):
+        if not atr[index]:
+            continue
+        plus_di = 100.0 * plus_smoothed[index] / atr[index]
+        minus_di = 100.0 * minus_smoothed[index] / atr[index]
+        denominator = plus_di + minus_di
+        dx[index] = (
+            0.0
+            if denominator == 0
+            else 100.0 * abs(plus_di - minus_di) / denominator
+        )
+
+    first_adx_index = seed_index + length - 1
+    first_dx = [
+        dx[index]
+        for index in range(seed_index, first_adx_index + 1)
+        if dx[index] is not None
+    ]
+    if len(first_dx) != length:
+        return result
+
+    result[first_adx_index] = sum(first_dx) / float(length)
+    for index in range(first_adx_index + 1, count):
+        if dx[index] is None:
+            continue
+        result[index] = (
+            result[index - 1] * (length - 1) + dx[index]
+        ) / float(length)
+    return result
+
+
+def _qqq_history_adx_bucket(value):
+    if value is None:
+        return "UNAVAILABLE"
+    if value < 15.0:
+        return "BELOW_15"
+    if value < 20.0:
+        return "15_TO_20"
+    if value < 25.0:
+        return "20_TO_25"
+    return "25_AND_ABOVE"
+
+
+def _qqq_history_round(value, places=4):
+    return round(value, places) if value is not None else ""
+
+
+def _qqq_history_summarize(events, completed_session_count):
+    horizons = ("return_15m_pct", "return_30m_pct", "return_60m_pct", "return_1545_pct")
+    summary = {
+        "trigger_days": len(events),
+        "completed_sessions": completed_session_count,
+        "trigger_frequency_pct": round(
+            (len(events) / completed_session_count) * 100.0, 2
+        ) if completed_session_count else 0.0,
+        "no_trigger_days": max(completed_session_count - len(events), 0),
+    }
+
+    for field in horizons:
+        values = [event.get(field) for event in events if event.get(field) is not None]
+        label = field.replace("_pct", "")
+        summary[label] = {
+            "observations": len(values),
+            "positive_pct": round(
+                sum(1 for value in values if value > 0) / len(values) * 100.0,
+                2,
+            ) if values else "",
+            "average_pct": _qqq_history_round(_qqq_history_average(values)),
+            "median_pct": _qqq_history_round(_qqq_history_median(values)),
+        }
+
+    summary["mfe_to_1545"] = {
+        "average_pct": _qqq_history_round(
+            _qqq_history_average([event.get("mfe_to_1545_pct") for event in events])
+        ),
+        "median_pct": _qqq_history_round(
+            _qqq_history_median([event.get("mfe_to_1545_pct") for event in events])
+        ),
+    }
+    summary["mae_to_1545"] = {
+        "average_pct": _qqq_history_round(
+            _qqq_history_average([event.get("mae_to_1545_pct") for event in events])
+        ),
+        "median_pct": _qqq_history_round(
+            _qqq_history_median([event.get("mae_to_1545_pct") for event in events])
+        ),
+    }
+
+    adx_buckets = {}
+    for bucket_name in ("BELOW_15", "15_TO_20", "20_TO_25", "25_AND_ABOVE", "UNAVAILABLE"):
+        bucket_events = [
+            event for event in events if event.get("adx_bucket") == bucket_name
+        ]
+        if not bucket_events:
+            continue
+        values_60 = [
+            event.get("return_60m_pct")
+            for event in bucket_events
+            if event.get("return_60m_pct") is not None
+        ]
+        values_close = [
+            event.get("return_1545_pct")
+            for event in bucket_events
+            if event.get("return_1545_pct") is not None
+        ]
+        adx_buckets[bucket_name] = {
+            "triggers": len(bucket_events),
+            "positive_60m_pct": round(
+                sum(1 for value in values_60 if value > 0) / len(values_60) * 100.0,
+                2,
+            ) if values_60 else "",
+            "average_60m_pct": _qqq_history_round(_qqq_history_average(values_60)),
+            "median_60m_pct": _qqq_history_round(_qqq_history_median(values_60)),
+            "positive_1545_pct": round(
+                sum(1 for value in values_close if value > 0) / len(values_close) * 100.0,
+                2,
+            ) if values_close else "",
+            "average_1545_pct": _qqq_history_round(_qqq_history_average(values_close)),
+            "median_1545_pct": _qqq_history_round(_qqq_history_median(values_close)),
+        }
+    summary["adx_buckets"] = adx_buckets
+    return summary
+
+
+@app.get("/odts-qqq-stage1-history")
+def odts_qqq_stage1_history():
+    """
+    Compare first-daily QQQ bullish signals over historical 3-minute bars.
+
+    This route reads QQQ underlying OHLCV bars only. It does not request an
+    option chain and has no order, confirmation, approval, or execution call.
+    """
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": error,
+            "next_step": "Open /login",
+        }), 401
+
+    try:
+        requested_days = int(request.args.get("days", "183"))
+    except (TypeError, ValueError):
+        requested_days = 183
+    requested_days = max(30, min(requested_days, 365))
+
+    end_et = now_et()
+    start_et = end_et - timedelta(days=requested_days)
+    bars_url = f"{TS_API_BASE_URL}/marketdata/barcharts/QQQ"
+    chunk_days = 30
+    raw_bars_by_timestamp = {}
+    chunk_start = start_et
+    requests_completed = 0
+
+    while chunk_start < end_et:
+        chunk_end = min(chunk_start + timedelta(days=chunk_days), end_et)
+        params = {
+            "interval": "3",
+            "unit": "Minute",
+            "firstdate": chunk_start.astimezone(timezone.utc).isoformat(),
+            "lastdate": chunk_end.astimezone(timezone.utc).isoformat(),
+            "sessiontemplate": "Default",
+        }
+
+        try:
+            response = requests.get(
+                bars_url,
+                headers=ts_headers(access_token),
+                params=params,
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "QQQ_STAGE1_HISTORY",
+                "error": f"QQQ historical-bar request failed: {exc}",
+                "requests_completed": requests_completed,
+            }), 502
+
+        if not response.ok:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "QQQ_STAGE1_HISTORY",
+                "status_code": response.status_code,
+                "response": response.text[:1000],
+                "failed_chunk_start": chunk_start.isoformat(),
+                "failed_chunk_end": chunk_end.isoformat(),
+                "requests_completed": requests_completed,
+            }), response.status_code
+
+        try:
+            body = response.json()
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "read_only": True,
+                "order_sent": False,
+                "project": "QQQ_STAGE1_HISTORY",
+                "error": "TradeStation historical bars were not valid JSON.",
+                "requests_completed": requests_completed,
+            }), 502
+
+        chunk_bars = body.get("Bars", []) if isinstance(body, dict) else []
+        for raw_bar in chunk_bars if isinstance(chunk_bars, list) else []:
+            timestamp = str(raw_bar.get("TimeStamp", "")).strip()
+            if timestamp:
+                raw_bars_by_timestamp[timestamp] = raw_bar
+
+        requests_completed += 1
+        chunk_start = chunk_end + timedelta(seconds=1)
+
+    raw_bars = list(raw_bars_by_timestamp.values())
+    parsed_bars = []
+    for raw_bar in raw_bars if isinstance(raw_bars, list) else []:
+        try:
+            raw_timestamp = str(raw_bar.get("TimeStamp", "")).strip()
+            bar_dt = datetime.fromisoformat(
+                raw_timestamp.replace("Z", "+00:00")
+            ).astimezone(ET)
+            high = float(raw_bar.get("High"))
+            low = float(raw_bar.get("Low"))
+            close = float(raw_bar.get("Close"))
+            volume = float(raw_bar.get("TotalVolume", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        minute_of_day = bar_dt.hour * 60 + bar_dt.minute
+        if not (570 <= minute_of_day <= 960):
+            continue
+        parsed_bars.append({
+            "dt": bar_dt,
+            "date": bar_dt.date(),
+            "minute": minute_of_day,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        })
+
+    parsed_bars.sort(key=lambda item: item["dt"])
+    if len(parsed_bars) < 100:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "project": "QQQ_STAGE1_HISTORY",
+            "error": "Not enough completed QQQ 3-minute bars were returned.",
+            "bars_received": len(parsed_bars),
+        }), 502
+
+    highs = [bar["high"] for bar in parsed_bars]
+    lows = [bar["low"] for bar in parsed_bars]
+    closes = [bar["close"] for bar in parsed_bars]
+    ema21 = _qqq_history_ema_series(closes, 21)
+
+    zlema_length = 5
+    zlema_lag = int((zlema_length - 1) / 2)
+    adjusted = []
+    for index, close in enumerate(closes):
+        adjusted.append(
+            close
+            if index < zlema_lag
+            else close + (close - closes[index - zlema_lag])
+        )
+    zlema5 = _qqq_history_ema_series(adjusted, zlema_length)
+    adx14 = _qqq_history_adx_series(highs, lows, closes, 14)
+
+    session_pv = 0.0
+    session_volume = 0.0
+    current_session = None
+    vwap = []
+    indices_by_date = {}
+    for index, bar in enumerate(parsed_bars):
+        if bar["date"] != current_session:
+            current_session = bar["date"]
+            session_pv = 0.0
+            session_volume = 0.0
+        typical_price = (bar["high"] + bar["low"] + bar["close"]) / 3.0
+        session_pv += typical_price * bar["volume"]
+        session_volume += bar["volume"]
+        vwap.append(
+            session_pv / session_volume if session_volume > 0 else None
+        )
+        indices_by_date.setdefault(bar["date"], []).append(index)
+
+    completed_dates = []
+    for session_date, indices in indices_by_date.items():
+        if any(parsed_bars[index]["minute"] >= 945 for index in indices):
+            completed_dates.append(session_date)
+    completed_dates.sort()
+
+    variants = {
+        "ZLEMA_ONLY": lambda index: True,
+        "ZLEMA_ABOVE_EMA21": lambda index: closes[index] > ema21[index],
+        "ZLEMA_ABOVE_VWAP": lambda index: (
+            vwap[index] is not None and closes[index] > vwap[index]
+        ),
+        "ZLEMA_ABOVE_EITHER": lambda index: (
+            closes[index] > ema21[index]
+            or (vwap[index] is not None and closes[index] > vwap[index])
+        ),
+        "ZLEMA_ABOVE_BOTH": lambda index: (
+            vwap[index] is not None
+            and closes[index] > ema21[index]
+            and closes[index] > vwap[index]
+        ),
+    }
+    events_by_variant = {name: [] for name in variants}
+
+    for session_date in completed_dates:
+        session_indices = indices_by_date[session_date]
+        analysis_indices = [
+            index for index in session_indices
+            if 600 <= parsed_bars[index]["minute"] < 900
+        ]
+        exit_indices = [
+            index for index in session_indices
+            if parsed_bars[index]["minute"] <= 945
+        ]
+        if not analysis_indices or not exit_indices:
+            continue
+        exit_1545_index = exit_indices[-1]
+
+        for variant_name, extra_condition in variants.items():
+            trigger_index = None
+            for index in analysis_indices:
+                if index < 2:
+                    continue
+                zlema_confirmed_bullish = (
+                    zlema5[index] > zlema5[index - 1]
+                    and zlema5[index - 1] > zlema5[index - 2]
+                )
+                if zlema_confirmed_bullish and extra_condition(index):
+                    trigger_index = index
+                    break
+
+            if trigger_index is None:
+                continue
+
+            entry = closes[trigger_index]
+            trigger_dt = parsed_bars[trigger_index]["dt"]
+
+            def forward_return(minutes):
+                target = trigger_dt + timedelta(minutes=minutes)
+                for candidate in session_indices:
+                    if candidate <= trigger_index:
+                        continue
+                    if parsed_bars[candidate]["dt"] >= target:
+                        if candidate > exit_1545_index:
+                            return None
+                        return (closes[candidate] / entry - 1.0) * 100.0
+                return None
+
+            path_indices = [
+                index for index in session_indices
+                if trigger_index <= index <= exit_1545_index
+            ]
+            path_high = max(highs[index] for index in path_indices)
+            path_low = min(lows[index] for index in path_indices)
+            event = {
+                "date": session_date.isoformat(),
+                "trigger_time_et": trigger_dt.strftime("%H:%M"),
+                "entry_price": round(entry, 4),
+                "ema21": round(ema21[trigger_index], 4),
+                "vwap": _qqq_history_round(vwap[trigger_index]),
+                "adx14": _qqq_history_round(adx14[trigger_index]),
+                "adx_bucket": _qqq_history_adx_bucket(adx14[trigger_index]),
+                "return_15m_pct": forward_return(15),
+                "return_30m_pct": forward_return(30),
+                "return_60m_pct": forward_return(60),
+                "return_1545_pct": (
+                    closes[exit_1545_index] / entry - 1.0
+                ) * 100.0,
+                "mfe_to_1545_pct": (path_high / entry - 1.0) * 100.0,
+                "mae_to_1545_pct": (path_low / entry - 1.0) * 100.0,
+            }
+            events_by_variant[variant_name].append(event)
+
+    summaries = {
+        name: _qqq_history_summarize(events, len(completed_dates))
+        for name, events in events_by_variant.items()
+    }
+
+    eligible_for_preliminary_choice = []
+    for name, summary in summaries.items():
+        sixty = summary.get("return_60m", {})
+        if summary.get("trigger_days", 0) >= 20 and sixty.get("positive_pct", "") != "":
+            eligible_for_preliminary_choice.append((
+                float(sixty["positive_pct"]),
+                float(sixty.get("median_pct", 0) or 0),
+                int(summary["trigger_days"]),
+                name,
+            ))
+    eligible_for_preliminary_choice.sort(reverse=True)
+    preliminary_choice = (
+        eligible_for_preliminary_choice[0][3]
+        if eligible_for_preliminary_choice
+        else "INSUFFICIENT_SAMPLE"
+    )
+
+    recent_examples = {
+        name: [
+            {
+                key: (_qqq_history_round(value) if isinstance(value, float) else value)
+                for key, value in event.items()
+            }
+            for event in events[-5:]
+        ]
+        for name, events in events_by_variant.items()
+    }
+
+    return jsonify({
+        "ok": True,
+        "read_only": True,
+        "order_sent": False,
+        "approval_enabled": False,
+        "option_data_requested": False,
+        "project": "QQQ_STAGE1_HISTORY",
+        "underlying": "QQQ",
+        "purpose": (
+            "Measure the first bullish underlying signal per completed session "
+            "before applying any option-contract rules."
+        ),
+        "requested_calendar_days": requested_days,
+        "history_requests_completed": requests_completed,
+        "history_request_chunk_days": chunk_days,
+        "first_bar_et": parsed_bars[0]["dt"].isoformat(),
+        "last_bar_et": parsed_bars[-1]["dt"].isoformat(),
+        "regular_session_3_minute_bars": len(parsed_bars),
+        "completed_sessions": len(completed_dates),
+        "definitions": {
+            "timeframe": "3 Minute",
+            "entry_window_et": "10:00-15:00",
+            "first_trigger_per_variant_per_day": True,
+            "zlema_length": 5,
+            "zlema_confirmation": "Two consecutive rising closed-bar values",
+            "ema_length": 21,
+            "vwap": "Session VWAP reset each trading date",
+            "adx_length": 14,
+            "adx_is_a_study_bucket_not_an_entry_gate": True,
+            "outcome_horizons": ["15m", "30m", "60m", "15:45 ET"],
+        },
+        "preliminary_best_60m_directional_variant": preliminary_choice,
+        "variant_results": summaries,
+        "recent_trigger_examples": recent_examples,
+        "limitations": [
+            "Underlying QQQ direction study only; this is not option P/L.",
+            "No commissions, spread slippage, or option Greeks are modeled.",
+            "The preliminary variant is in-sample and must remain SIM/read-only.",
+        ],
+        "safety": "READ ONLY - NO OPTION CHAIN AND NO ORDER CAPABILITY",
+    }), 200
+
+
+if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
+
+
+# ==============================================================
+# NVDA COVERED CALL - IV PERCENTILE API DISCOVERY #13
+# READ ONLY / NO ORDER SUBMISSION
+# ==============================================================
+@app.get("/odts-nvda-iv-percentile-test")
+def odts_nvda_iv_percentile_test():
+
+    """Inspect live TradeStation v3 payloads for a native IV percentile/rank field."""
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "approval_enabled": False,
+            "project": "NVDA_COVERED_CALL_IV_PERCENTILE_DISCOVERY_13",
+            "error": error, "next_step": "Open /login",
+        }), 401
+
+    underlying = "NVDA"
+
+    def clean_keys(payload):
+        return sorted(str(k) for k in payload.keys()) if isinstance(payload, dict) else []
+
+    def percentile_like_fields(payload):
+        if not isinstance(payload, dict):
+            return {}
+        result = {}
+        for key, value in payload.items():
+            name = str(key).lower().replace("_", "").replace("-", "")
+            if ("percentile" in name or "ivrank" in name
+                    or "volatilityrank" in name or "ivpercent" in name):
+                result[str(key)] = value
+        return result
+
+    quote_payload, quote_error, quote_response = {}, None, None
+    try:
+        quote_url = f"{TS_API_BASE_URL}/marketdata/stream/quotes/{requests.utils.quote(underlying, safe='')}"
+        quote_response = requests.get(
+            quote_url, headers=ts_headers(access_token),
+            stream=True, timeout=(3, 4)
+        )
+        if quote_response.ok:
+            for line in quote_response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line.decode("utf-8", errors="replace").strip())
+                except ValueError:
+                    continue
+                if item.get("StreamStatus") or item.get("Error"):
+                    continue
+                quote_payload = item
+                break
+        else:
+            quote_error = f"HTTP {quote_response.status_code}: {quote_response.text[:500]}"
+    except requests.RequestException as exc:
+        quote_error = str(exc)
+    finally:
+        if quote_response is not None:
+            try:
+                quote_response.close()
+            except Exception:
+                pass
+
+    chain_payload, chain_error, chain_response = {}, None, None
+    try:
+        chain_url = f"{TS_API_BASE_URL}/marketdata/stream/options/chains/{underlying}"
+        chain_response = requests.get(
+            chain_url, headers=ts_headers(access_token),
+            params={
+                "strikeProximity": 5, "spreadType": "Single",
+                "enableGreeks": "true", "optionType": "Call",
+            },
+            stream=True, timeout=(3, 4)
+        )
+        if chain_response.ok:
+            for line in chain_response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line.decode("utf-8", errors="replace").strip())
+                except ValueError:
+                    continue
+                if item.get("StreamStatus") or item.get("Error"):
+                    continue
+                chain_payload = item
+                break
+        else:
+            chain_error = f"HTTP {chain_response.status_code}: {chain_response.text[:500]}"
+    except requests.RequestException as exc:
+        chain_error = str(exc)
+    finally:
+        if chain_response is not None:
+            try:
+                chain_response.close()
+            except Exception:
+                pass
+
+    quote_fields = percentile_like_fields(quote_payload)
+    chain_fields = percentile_like_fields(chain_payload)
+    native_found = bool(quote_fields or chain_fields)
+
+    return jsonify({
+        "ok": True, "read_only": True, "order_sent": False,
+        "approval_enabled": False,
+        "project": "NVDA_COVERED_CALL_IV_PERCENTILE_DISCOVERY_13",
+        "stock": underlying,
+        "native_iv_percentile_field_found": native_found,
+        "quote_percentile_like_fields": quote_fields,
+        "option_chain_percentile_like_fields": chain_fields,
+        "quote_payload_keys": clean_keys(quote_payload),
+        "option_chain_payload_keys": clean_keys(chain_payload),
+        "quote_error": quote_error or "",
+        "option_chain_error": chain_error or "",
+        "contract_implied_volatility": chain_payload.get("ImpliedVolatility", "") if isinstance(chain_payload, dict) else "",
+        "interpretation": (
+            "Native IV percentile/rank field found. Validate its scale before using it."
+            if native_found else
+            "No native IV percentile/rank field found in the sampled TradeStation v3 quote or option-chain payload. Do not substitute contract ImpliedVolatility for IV Percentile."
+        ),
+        "safety": "READ ONLY diagnostic. No covered-call, QQQ, SOXL, or other order function is called.",
+    }), 200
