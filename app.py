@@ -1,6 +1,9 @@
 import os
 import time
 import secrets
+import base64
+import hashlib
+import hmac
 import logging
 import csv
 import json
@@ -9557,3 +9560,822 @@ def odts_nvda_iv_percentile_test():
         ),
         "safety": "READ ONLY diagnostic. No covered-call, QQQ, SOXL, or other order function is called.",
     }), 200
+
+
+# ==============================================================
+# QQQ EXCEL WAR ROOM -> RENDER -> TRADESTATION CENTRAL BRIDGE V2
+# SIM/LIVE, ACCOUNT AND QUANTITY ARE CENTRAL CONTROLS.
+# LIVE SUBMISSION IS HARD-GATED OFF BY DEFAULT.
+# ==============================================================
+
+QQQ_EXCEL_BRIDGE_TOKEN = os.getenv(
+    "QQQ_EXCEL_BRIDGE_TOKEN", ""
+).strip()
+QQQ_EXCEL_EXECUTION_TOKEN = os.getenv(
+    "QQQ_EXCEL_EXECUTION_TOKEN", ""
+).strip()
+QQQ_EXCEL_SIM_EXECUTION_ENABLED = os.getenv(
+    "QQQ_EXCEL_SIM_EXECUTION_ENABLED", "NO"
+).strip().upper()
+QQQ_EXCEL_LIVE_EXECUTION_ENABLED = os.getenv(
+    "QQQ_EXCEL_LIVE_EXECUTION_ENABLED", "NO"
+).strip().upper()
+QQQ_EXCEL_LIVE_EXECUTION_TOKEN = os.getenv(
+    "QQQ_EXCEL_LIVE_EXECUTION_TOKEN", ""
+).strip()
+QQQ_EXCEL_MAX_QUANTITY = 4
+QQQ_EXCEL_ABSOLUTE_MAX_TOTAL_LOSS = float(os.getenv(
+    "QQQ_EXCEL_ABSOLUTE_MAX_TOTAL_LOSS", "340"
+))
+
+QQQ_EXCEL_PREVIEW_TTL_SECONDS = 120
+QQQ_EXCEL_MAX_QUOTE_AGE_SECONDS = 60
+QQQ_EXCEL_MAX_LOSS_DOLLARS = 85.0
+QQQ_EXCEL_MIN_REWARD_RISK = 1.35
+
+qqq_excel_preview_lock = threading.Lock()
+qqq_excel_previews = {}
+qqq_excel_monitors = {}
+
+
+def _qqq_excel_encode_monitor(monitor):
+    payload = json.dumps(monitor, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        QQQ_EXCEL_BRIDGE_TOKEN.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _qqq_excel_decode_monitor(monitor_id):
+    try:
+        encoded, signature = str(monitor_id or "").rsplit(".", 1)
+        expected = hmac.new(
+            QQQ_EXCEL_BRIDGE_TOKEN.encode("utf-8"),
+            encoded.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        padded = encoded + "=" * (-len(encoded) % 4)
+        monitor = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        if not isinstance(monitor, dict):
+            return None
+        return monitor
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _qqq_excel_number(value, field_name):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be numeric.")
+    if number <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+    return number
+
+
+def _qqq_excel_authorized():
+    supplied = str(request.headers.get("X-QQQ-Bridge-Token") or "")
+    return bool(
+        QQQ_EXCEL_BRIDGE_TOKEN
+        and supplied
+        and secrets.compare_digest(supplied, QQQ_EXCEL_BRIDGE_TOKEN)
+    )
+
+
+def _qqq_excel_execution_authorized():
+    supplied = str(request.headers.get("X-QQQ-Execution-Token") or "")
+    return bool(
+        QQQ_EXCEL_EXECUTION_TOKEN
+        and supplied
+        and secrets.compare_digest(supplied, QQQ_EXCEL_EXECUTION_TOKEN)
+    )
+
+
+def _qqq_excel_live_execution_authorized():
+    supplied = str(request.headers.get("X-QQQ-Live-Execution-Token") or "")
+    return bool(
+        QQQ_EXCEL_LIVE_EXECUTION_TOKEN
+        and supplied
+        and secrets.compare_digest(supplied, QQQ_EXCEL_LIVE_EXECUTION_TOKEN)
+    )
+
+
+def _qqq_excel_environment_settings(environment):
+    environment = str(environment or "").strip().upper()
+    if environment == "SIM":
+        return {
+            "environment": "SIM",
+            "api_base": "https://sim-api.tradestation.com/v3",
+            "configured_account": TS_SIM_ACCOUNT_ID,
+            "execution_enabled": QQQ_EXCEL_SIM_EXECUTION_ENABLED == "YES",
+        }
+    if environment == "LIVE":
+        return {
+            "environment": "LIVE",
+            "api_base": TS_LIVE_API_BASE_URL,
+            "configured_account": TS_LIVE_ACCOUNT_ID,
+            "execution_enabled": QQQ_EXCEL_LIVE_EXECUTION_ENABLED == "YES",
+        }
+    raise ValueError("environment must be SIM or LIVE.")
+
+
+def _qqq_excel_parse_et_timestamp(value):
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("feed_timestamp_et is required.")
+    parsed = None
+    for candidate in (raw, raw.replace("Z", "+00:00")):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            break
+        except ValueError:
+            pass
+    if parsed is None:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                pass
+    if parsed is None:
+        raise ValueError("feed_timestamp_et must be a valid date and time.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ET)
+    else:
+        parsed = parsed.astimezone(ET)
+    return parsed
+
+
+def _qqq_excel_validate_request(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be one JSON object.")
+
+    if str(payload.get("project") or "").strip().upper() != "QQQ_VERTICAL_V1":
+        raise ValueError("project must be QQQ_VERTICAL_V1.")
+    environment = str(payload.get("environment") or "").strip().upper()
+    environment_settings = _qqq_excel_environment_settings(environment)
+    configured_account = str(environment_settings["configured_account"] or "").strip()
+    requested_account = str(payload.get("account_id") or "").strip()
+    if not configured_account:
+        raise ValueError(f"The configured {environment} account is missing in Render.")
+    if not requested_account:
+        raise ValueError("account_id is required.")
+    if requested_account.upper() != configured_account.upper():
+        raise ValueError(
+            f"Blocked: account_id does not match the configured {environment} account."
+        )
+    live_confirmation = str(payload.get("live_confirmation") or "").strip().upper()
+    if environment == "LIVE" and live_confirmation != "LIVE APPROVE":
+        raise ValueError("Blocked: LIVE confirmation must be LIVE APPROVE.")
+    if str(payload.get("underlying") or "").strip().upper() != "QQQ":
+        raise ValueError("underlying must be QQQ.")
+
+    user_approval = str(payload.get("user_approval") or "").strip().upper()
+    proposal_decision = str(payload.get("proposal_decision") or "").strip().upper()
+    quote_freshness = str(payload.get("quote_freshness") or "").strip().upper()
+    trend_condition = str(payload.get("trend_condition") or "").strip().upper()
+    spread_structure = str(payload.get("spread_structure") or "").strip().upper()
+    max_loss_rule = str(payload.get("max_loss_rule") or "").strip().upper()
+    min_reward_risk_rule = str(payload.get("min_reward_risk_rule") or "").strip().upper()
+    trend = str(payload.get("trend") or "").strip().upper()
+    spread_type = str(payload.get("spread_type") or "").strip().upper()
+
+    required_gate_values = {
+        "user_approval": (user_approval, "APPROVE"),
+        "proposal_decision": (proposal_decision, "REVIEW ONLY"),
+        "quote_freshness": (quote_freshness, "FRESH"),
+        "trend_condition": (trend_condition, "YES"),
+        "spread_structure": (spread_structure, "YES"),
+        "max_loss_rule": (max_loss_rule, "YES"),
+        "min_reward_risk_rule": (min_reward_risk_rule, "YES"),
+    }
+    for field_name, (actual, required) in required_gate_values.items():
+        if actual != required:
+            raise ValueError(
+                f"Blocked: {field_name} must be {required}; received {actual or 'blank'}."
+            )
+
+    if spread_type not in {"CALL DEBIT", "PUT DEBIT"}:
+        raise ValueError("spread_type must be CALL DEBIT or PUT DEBIT.")
+    if trend not in {"BULLISH", "BEARISH"}:
+        raise ValueError("trend must be BULLISH or BEARISH.")
+    if (trend == "BULLISH" and spread_type != "CALL DEBIT") or (
+        trend == "BEARISH" and spread_type != "PUT DEBIT"
+    ):
+        raise ValueError("Blocked: spread_type does not match the current trend.")
+
+    expiration_text = str(payload.get("expiration") or "").strip()
+    try:
+        expiration = datetime.strptime(expiration_text, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError("expiration must use YYYY-MM-DD.")
+    calendar_dte = (expiration - now_et().date()).days
+    if calendar_dte < 1 or calendar_dte > 7:
+        raise ValueError("Blocked: expiration must be 1 through 7 calendar days away.")
+
+    quantity = _qqq_excel_number(payload.get("quantity"), "quantity")
+    if not quantity.is_integer() or int(quantity) > QQQ_EXCEL_MAX_QUANTITY:
+        raise ValueError(
+            f"Blocked: quantity must be a whole number from 1 through {QQQ_EXCEL_MAX_QUANTITY}."
+        )
+    quantity = int(quantity)
+
+    buy_strike = round(_qqq_excel_number(payload.get("buy_strike"), "buy_strike"), 4)
+    sell_strike = round(_qqq_excel_number(payload.get("sell_strike"), "sell_strike"), 4)
+    workbook_debit = round(_qqq_excel_number(payload.get("entry_debit"), "entry_debit"), 4)
+    workbook_max_loss = round(_qqq_excel_number(payload.get("max_loss"), "max_loss"), 2)
+    workbook_reward_risk = round(
+        _qqq_excel_number(payload.get("reward_risk"), "reward_risk"), 4
+    )
+
+    if spread_type == "CALL DEBIT" and not buy_strike < sell_strike:
+        raise ValueError("Blocked: CALL DEBIT buy strike must be below sell strike.")
+    if spread_type == "PUT DEBIT" and not buy_strike > sell_strike:
+        raise ValueError("Blocked: PUT DEBIT buy strike must be above sell strike.")
+    approved_total_loss = round(
+        _qqq_excel_number(payload.get("approved_total_loss"), "approved_total_loss"), 2
+    )
+    expected_total_loss = round(workbook_max_loss * quantity, 2)
+    if workbook_max_loss > QQQ_EXCEL_MAX_LOSS_DOLLARS:
+        raise ValueError("Blocked: workbook maximum loss per spread exceeds $85.")
+    if expected_total_loss > approved_total_loss:
+        raise ValueError(
+            f"Blocked: expected total loss ${expected_total_loss:.2f} exceeds the "
+            f"approved total loss ${approved_total_loss:.2f}."
+        )
+    if approved_total_loss > QQQ_EXCEL_ABSOLUTE_MAX_TOTAL_LOSS:
+        raise ValueError(
+            "Blocked: approved total loss exceeds the Render absolute safety limit."
+        )
+    if workbook_reward_risk < QQQ_EXCEL_MIN_REWARD_RISK:
+        raise ValueError("Blocked: workbook reward/risk is below 1.35.")
+
+    feed_timestamp = _qqq_excel_parse_et_timestamp(payload.get("feed_timestamp_et"))
+    quote_age_seconds = (now_et() - feed_timestamp).total_seconds()
+    if quote_age_seconds < -5 or quote_age_seconds > QQQ_EXCEL_MAX_QUOTE_AGE_SECONDS:
+        raise ValueError(
+            f"Blocked: TradeStation feed age is {quote_age_seconds:.1f} seconds; "
+            "maximum is 60 seconds."
+        )
+
+    return {
+        "project": "QQQ_VERTICAL_V1",
+        "environment": environment,
+        "api_base": environment_settings["api_base"],
+        "account_id": configured_account,
+        "live_confirmation": live_confirmation,
+        "underlying": "QQQ",
+        "user_approval": user_approval,
+        "proposal_decision": proposal_decision,
+        "quote_freshness": quote_freshness,
+        "trend": trend,
+        "spread_type": spread_type,
+        "expiration": expiration,
+        "calendar_dte": calendar_dte,
+        "buy_strike": buy_strike,
+        "sell_strike": sell_strike,
+        "quantity": quantity,
+        "workbook_debit": workbook_debit,
+        "workbook_max_loss": workbook_max_loss,
+        "expected_total_loss": expected_total_loss,
+        "approved_total_loss": approved_total_loss,
+        "workbook_reward_risk": workbook_reward_risk,
+        "feed_timestamp_et": feed_timestamp,
+        "quote_age_seconds": round(quote_age_seconds, 3),
+    }
+
+
+def _qqq_excel_resolve_vertical(access_token, validated):
+    option_type = "Call" if validated["spread_type"] == "CALL DEBIT" else "Put"
+    chain_url = f"{validated['api_base']}/marketdata/stream/options/chains/QQQ"
+    params = {
+        "expiration": validated["expiration"].strftime("%m-%d-%Y"),
+        "strikeProximity": 40,
+        "spreadType": "Single",
+        "enableGreeks": "true",
+        "optionType": option_type,
+    }
+    wanted = {
+        round(validated["buy_strike"], 4): "buy",
+        round(validated["sell_strike"], 4): "sell",
+    }
+    found = {}
+    response = None
+    message_count = 0
+    try:
+        response = requests.get(
+            chain_url,
+            headers=ts_headers(access_token),
+            params=params,
+            stream=True,
+            timeout=(5, 8),
+        )
+        if not response.ok:
+            return False, {
+                "error": "TradeStation option-chain request failed.",
+                "status_code": response.status_code,
+                "response": response.text[:1000],
+            }
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                item = json.loads(line.decode("utf-8", errors="replace").strip())
+            except ValueError:
+                continue
+            if item.get("StreamStatus") in {"EndSnapshot", "GoAway"}:
+                break
+            message_count += 1
+            legs = item.get("Legs") or []
+            leg = legs[0] if legs and isinstance(legs[0], dict) else {}
+            try:
+                strike = round(float(leg.get("StrikePrice")), 4)
+                bid = float(item.get("Bid"))
+                ask = float(item.get("Ask"))
+            except (TypeError, ValueError):
+                continue
+            if strike not in wanted or bid <= 0 or ask <= 0 or ask < bid:
+                continue
+            symbol = str(leg.get("Symbol") or item.get("Symbol") or "").strip().upper()
+            if not symbol.startswith("QQQ"):
+                continue
+            found[wanted[strike]] = {
+                "symbol": symbol,
+                "strike": strike,
+                "bid": round(bid, 4),
+                "ask": round(ask, 4),
+                "delta": item.get("Delta"),
+                "open_interest": item.get("DailyOpenInterest"),
+            }
+            if len(found) == 2:
+                break
+            if message_count >= 250:
+                break
+    except requests.RequestException as exc:
+        return False, {"error": f"TradeStation option-chain request failed: {exc}"}
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    if "buy" not in found or "sell" not in found:
+        return False, {
+            "error": "The exact two QQQ option legs were not found in the current chain.",
+            "buy_strike": validated["buy_strike"],
+            "sell_strike": validated["sell_strike"],
+            "expiration": validated["expiration"].isoformat(),
+            "messages_read": message_count,
+        }
+
+    current_debit = round(found["buy"]["ask"] - found["sell"]["bid"], 2)
+    if current_debit <= 0:
+        return False, {"error": "Current conservative net debit is not positive."}
+    current_max_loss = round(current_debit * 100.0, 2)
+    current_total_max_loss = round(current_max_loss * validated["quantity"], 2)
+    if current_max_loss > QQQ_EXCEL_MAX_LOSS_DOLLARS:
+        return False, {
+            "error": "Current repriced maximum loss per spread exceeds $85.",
+            "current_debit": current_debit,
+            "current_max_loss": current_max_loss,
+        }
+    if current_total_max_loss > validated["approved_total_loss"]:
+        return False, {
+            "error": "Current repriced total maximum loss exceeds the approved total loss.",
+            "current_debit": current_debit,
+            "current_max_loss_per_spread": current_max_loss,
+            "current_total_max_loss": current_total_max_loss,
+            "approved_total_loss": validated["approved_total_loss"],
+        }
+    max_allowed_debit = round(validated["workbook_debit"] * 1.05, 2)
+    if current_debit > max_allowed_debit:
+        return False, {
+            "error": "Current net debit is more than 5% above the approved workbook debit.",
+            "approved_debit": validated["workbook_debit"],
+            "current_debit": current_debit,
+            "max_allowed_debit": max_allowed_debit,
+        }
+
+    order = {
+        "AccountID": validated["account_id"],
+        "OrderType": "Limit",
+        "LimitPrice": f"{current_debit:.2f}",
+        "TimeInForce": {"Duration": "DAY"},
+        "Route": "Intelligent",
+        "Legs": [
+            {
+                "Symbol": found["buy"]["symbol"],
+                "Quantity": str(validated["quantity"]),
+                "TradeAction": "BUYTOOPEN",
+            },
+            {
+                "Symbol": found["sell"]["symbol"],
+                "Quantity": str(validated["quantity"]),
+                "TradeAction": "SELLTOOPEN",
+            },
+        ],
+    }
+    return True, {
+        "buy_leg": found["buy"],
+        "sell_leg": found["sell"],
+        "current_debit": current_debit,
+        "current_max_loss": current_max_loss,
+        "current_total_max_loss": current_total_max_loss,
+        "order": order,
+    }
+
+
+def _qqq_excel_public_validated(validated):
+    public = dict(validated)
+    public.pop("api_base", None)
+    public["expiration"] = validated["expiration"].isoformat()
+    public["feed_timestamp_et"] = validated["feed_timestamp_et"].isoformat()
+    return public
+
+
+@app.get("/qqq-excel-bridge-status")
+def qqq_excel_bridge_status():
+    return jsonify({
+        "ok": True,
+        "project": "QQQ_VERTICAL_V1",
+        "phase": "6_CENTRAL_SIM_LIVE_CONTROL",
+        "supported_environments": ["SIM", "LIVE"],
+        "maximum_quantity": QQQ_EXCEL_MAX_QUANTITY,
+        "absolute_maximum_total_loss": QQQ_EXCEL_ABSOLUTE_MAX_TOTAL_LOSS,
+        "bridge_token_configured": bool(QQQ_EXCEL_BRIDGE_TOKEN),
+        "sim_account_configured": bool(TS_SIM_ACCOUNT_ID),
+        "live_account_configured": bool(TS_LIVE_ACCOUNT_ID),
+        "authenticated": bool(token_store.get("access_token")),
+        "preview_endpoint": "/qqq-excel-preview",
+        "submit_endpoint": "/qqq-excel-submit",
+        "health_endpoint": "/qqq-excel-health",
+        "sim_execution_enabled": QQQ_EXCEL_SIM_EXECUTION_ENABLED == "YES",
+        "live_execution_enabled": QQQ_EXCEL_LIVE_EXECUTION_ENABLED == "YES",
+        "master_trading_enabled": TRADING_ENABLED == "YES",
+        "read_only": not (
+            QQQ_EXCEL_SIM_EXECUTION_ENABLED == "YES"
+            or QQQ_EXCEL_LIVE_EXECUTION_ENABLED == "YES"
+        ),
+        "order_sent": False,
+        "safety": (
+            "Preview uses the selected environment's TradeStation orderconfirm endpoint. "
+            "SIM and LIVE submissions have independent server gates. LIVE is disabled by default."
+        ),
+    }), 200
+
+
+@app.post("/qqq-excel-sim-preview")
+@app.post("/qqq-excel-preview")
+def qqq_excel_sim_preview():
+    if not _qqq_excel_authorized():
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "result": "BRIDGE_AUTHENTICATION_FAILED",
+        }), 401
+    if not request.is_json:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "error": "Content-Type must be application/json.",
+        }), 415
+    if not odts_sim_session_now():
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "BLOCKED_OUTSIDE_MARKET_HOURS",
+            "error": "Preview requires the 09:30-16:00 ET regular session.",
+        }), 403
+
+    try:
+        validated = _qqq_excel_validate_request(request.get_json(silent=False))
+    except (ValueError, TypeError) as exc:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "WORKBOOK_GATES_BLOCKED",
+            "error": str(exc),
+        }), 400
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "error": error, "next_step": "Open /login first.",
+        }), 401
+
+    resolved_ok, resolved = _qqq_excel_resolve_vertical(access_token, validated)
+    if not resolved_ok:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "CURRENT_OPTION_REVALIDATION_BLOCKED",
+            "detail": resolved,
+        }), 409
+
+    try:
+        confirmation_response = requests.post(
+            f"{validated['api_base']}/orderexecution/orderconfirm",
+            headers=ts_headers(access_token),
+            json=resolved["order"],
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "error": (
+                f"TradeStation {validated['environment']} confirmation request failed: {exc}"
+            ),
+        }), 502
+
+    try:
+        ts_body = confirmation_response.json()
+    except ValueError:
+        ts_body = {"raw_response": confirmation_response.text[:2000]}
+    if not confirmation_response.ok:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "order_sent": False,
+            "result": "TRADESTATION_CONFIRMATION_REJECTED",
+            "trade_station_status_code": confirmation_response.status_code,
+            "trade_station_confirmation": ts_body,
+        }), 502
+
+    preview_id = secrets.token_urlsafe(24)
+    now_ts = time.time()
+    with qqq_excel_preview_lock:
+        qqq_excel_previews[preview_id] = {
+            "created_at": now_ts,
+            "expires_at": now_ts + QQQ_EXCEL_PREVIEW_TTL_SECONDS,
+            "used": False,
+            "validated": validated,
+            "resolved": resolved,
+        }
+        stale = [
+            key for key, value in qqq_excel_previews.items()
+            if value.get("expires_at", 0) < now_ts - 300
+        ]
+        for key in stale:
+            qqq_excel_previews.pop(key, None)
+
+    return jsonify({
+        "ok": True,
+        "project": "QQQ_VERTICAL_V1",
+        "environment": validated["environment"],
+        "result": "DRY_RUN_ACCEPTED",
+        "read_only": True,
+        "order_sent": False,
+        "preview_id": preview_id,
+        "preview_expires_in_seconds": QQQ_EXCEL_PREVIEW_TTL_SECONDS,
+        "validated_input": _qqq_excel_public_validated(validated),
+        "current_option_snapshot": {
+            key: value for key, value in resolved.items() if key != "order"
+        },
+        "trade_station_status_code": confirmation_response.status_code,
+        "trade_station_confirmation": ts_body,
+        "execution_enabled": _qqq_excel_environment_settings(
+            validated["environment"]
+        )["execution_enabled"],
+        "safety": (
+            f"TRADESTATION {validated['environment']} CONFIRMATION ONLY. "
+            "/orderexecution/orders was not called."
+        ),
+    }), 200
+
+
+@app.post("/qqq-excel-sim-submit")
+@app.post("/qqq-excel-submit")
+def qqq_excel_sim_submit():
+    if not _qqq_excel_authorized() or not _qqq_excel_execution_authorized():
+        return jsonify({
+            "ok": False, "order_sent": False,
+            "result": "EXECUTION_AUTHENTICATION_FAILED",
+        }), 401
+    if TRADING_ENABLED != "YES":
+        return jsonify({
+            "ok": False, "order_sent": False,
+            "result": "MASTER_TRADING_DISABLED",
+            "error": "TRADING_ENABLED is not YES.",
+        }), 403
+    if not odts_sim_session_now():
+        return jsonify({
+            "ok": False, "order_sent": False,
+            "result": "SESSION_GATE_BLOCKED",
+        }), 403
+    body = request.get_json(silent=True) or {}
+    preview_id = str(body.get("preview_id") or "").strip()
+    with qqq_excel_preview_lock:
+        preview = qqq_excel_previews.get(preview_id)
+        if not preview:
+            return jsonify({
+                "ok": False, "order_sent": False,
+                "result": "PREVIEW_NOT_FOUND",
+            }), 404
+        if preview.get("used"):
+            return jsonify({
+                "ok": False, "order_sent": False,
+                "result": "PREVIEW_ALREADY_USED",
+            }), 409
+        if time.time() > float(preview.get("expires_at", 0)):
+            preview["used"] = True
+            return jsonify({
+                "ok": False, "order_sent": False,
+                "result": "PREVIEW_EXPIRED",
+            }), 409
+        validated = preview["validated"]
+        environment = validated["environment"]
+        settings = _qqq_excel_environment_settings(environment)
+        if not settings["execution_enabled"]:
+            return jsonify({
+                "ok": False,
+                "environment": environment,
+                "order_sent": False,
+                "result": "EXECUTION_DISABLED",
+                "error": f"{environment} execution is disabled in Render.",
+            }), 403
+        if environment == "LIVE" and not _qqq_excel_live_execution_authorized():
+            return jsonify({
+                "ok": False,
+                "environment": "LIVE",
+                "order_sent": False,
+                "result": "LIVE_EXECUTION_AUTHENTICATION_FAILED",
+            }), 401
+        preview["used"] = True
+        order = dict(preview["resolved"]["order"])
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False, "order_sent": False, "error": error,
+            "next_step": "Open /login first.",
+        }), 401
+    try:
+        response = requests.post(
+            f"{settings['api_base']}/orderexecution/orders",
+            headers=ts_headers(access_token),
+            json=order,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False, "order_sent": False,
+            "error": f"TradeStation {environment} spread submission failed: {exc}",
+        }), 502
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+    monitor_id = ""
+    if response.ok:
+        monitor_record = {
+            "created_at": time.time(),
+            "environment": environment,
+            "api_base": settings["api_base"],
+            "account_id": validated["account_id"],
+            "quantity": validated["quantity"],
+            "buy_leg": preview["resolved"]["buy_leg"],
+            "sell_leg": preview["resolved"]["sell_leg"],
+            "entry_debit": preview["resolved"]["current_debit"],
+            "entry_total_max_loss": preview["resolved"]["current_total_max_loss"],
+        }
+        monitor_id = _qqq_excel_encode_monitor(monitor_record)
+        with qqq_excel_preview_lock:
+            qqq_excel_monitors[monitor_id] = monitor_record
+    return jsonify({
+        "ok": response.ok,
+        "project": "QQQ_VERTICAL_V1",
+        "environment": environment,
+        "result": (
+            f"{environment}_SPREAD_ORDER_SUBMITTED"
+            if response.ok else f"{environment}_ORDER_REJECTED"
+        ),
+        "order_sent": bool(response.ok),
+        "monitor_id": monitor_id,
+        "trade_station_status_code": response.status_code,
+        "trade_station_response": ts_body,
+    }), 200 if response.ok else 502
+
+
+def _qqq_excel_position_view(position):
+    return {
+        "symbol": position.get("Symbol"),
+        "quantity": position.get("Quantity"),
+        "average_price": position.get("AveragePrice"),
+        "last": position.get("Last"),
+        "market_value": position.get("MarketValue"),
+        "unrealized_profit_loss": position.get("UnrealizedProfitLoss"),
+        "unrealized_profit_loss_percent": position.get("UnrealizedProfitLossPercent"),
+        "timestamp": position.get("Timestamp"),
+    }
+
+
+@app.post("/qqq-excel-health")
+def qqq_excel_health():
+    if not _qqq_excel_authorized():
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "BRIDGE_AUTHENTICATION_FAILED",
+        }), 401
+    body = request.get_json(silent=True) or {}
+    monitor_id = str(body.get("monitor_id") or "").strip()
+    with qqq_excel_preview_lock:
+        monitor = qqq_excel_monitors.get(monitor_id)
+        if monitor:
+            monitor = dict(monitor)
+    if not monitor:
+        monitor = _qqq_excel_decode_monitor(monitor_id)
+    if not monitor:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "MONITOR_NOT_FOUND",
+            "error": "Use the monitor_id returned by a successful spread submission.",
+        }), 404
+
+    access_token, error = get_valid_access_token()
+    if not access_token:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "error": error, "next_step": "Open /login first.",
+        }), 401
+    url = (
+        f"{monitor['api_base']}/brokerage/accounts/"
+        f"{monitor['account_id']}/positions"
+    )
+    try:
+        response = requests.get(url, headers=ts_headers(access_token), timeout=20)
+    except requests.RequestException as exc:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "error": f"TradeStation position-health request failed: {exc}",
+        }), 502
+    try:
+        ts_body = response.json()
+    except ValueError:
+        ts_body = {"raw_response": response.text[:2000]}
+    if not response.ok:
+        return jsonify({
+            "ok": False, "read_only": True, "order_sent": False,
+            "result": "TRADESTATION_POSITION_QUERY_FAILED",
+            "trade_station_status_code": response.status_code,
+            "trade_station_response": ts_body,
+        }), 502
+
+    positions = ts_body.get("Positions", []) if isinstance(ts_body, dict) else []
+    if not isinstance(positions, list):
+        positions = []
+    symbols = {
+        str(monitor["buy_leg"].get("symbol") or "").upper(),
+        str(monitor["sell_leg"].get("symbol") or "").upper(),
+    }
+    matched = [
+        item for item in positions
+        if str(item.get("Symbol") or "").strip().upper() in symbols
+    ]
+    quantities = {}
+    total_unrealized = 0.0
+    for item in matched:
+        symbol = str(item.get("Symbol") or "").strip().upper()
+        try:
+            quantities[symbol] = float(item.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            quantities[symbol] = 0.0
+        try:
+            total_unrealized += float(item.get("UnrealizedProfitLoss") or 0)
+        except (TypeError, ValueError):
+            pass
+    buy_symbol = str(monitor["buy_leg"].get("symbol") or "").upper()
+    sell_symbol = str(monitor["sell_leg"].get("symbol") or "").upper()
+    expected = float(monitor["quantity"])
+    buy_qty = quantities.get(buy_symbol, 0.0)
+    sell_qty = quantities.get(sell_symbol, 0.0)
+    if buy_qty == 0 and sell_qty == 0:
+        health_status = "FLAT_OR_NOT_YET_FILLED"
+    elif abs(buy_qty) == expected and abs(sell_qty) == expected:
+        health_status = "BOTH_LEGS_PRESENT"
+    else:
+        health_status = "ATTENTION_LEG_QUANTITY_MISMATCH"
+
+    return jsonify({
+        "ok": True,
+        "project": "QQQ_VERTICAL_V1",
+        "environment": monitor["environment"],
+        "read_only": True,
+        "order_sent": False,
+        "monitor_id": monitor_id,
+        "health_status": health_status,
+        "expected_quantity_each_leg": monitor["quantity"],
+        "buy_symbol": buy_symbol,
+        "buy_position_quantity": buy_qty,
+        "sell_symbol": sell_symbol,
+        "sell_position_quantity": sell_qty,
+        "estimated_total_unrealized_profit_loss": round(total_unrealized, 2),
+        "entry_debit": monitor["entry_debit"],
+        "entry_total_max_loss": monitor["entry_total_max_loss"],
+        "positions": [_qqq_excel_position_view(item) for item in matched],
+        "safety": "READ ONLY. No order, replace, cancel, or corrective action was called.",
+    }), 200
+ChatAI
