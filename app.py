@@ -6699,8 +6699,18 @@ def odts_vertical_test():
         and adx_gate in {"YES", "CAUTION"}
     )
 
-    # No need to stream an option chain when the market direction is neutral.
-    if direction != "BULLISH":
+    # Explicit, read-only diagnostic: inspect BULL CALL candidates even when
+    # the current market direction is BEARISH or NEUTRAL. This never changes
+    # market_gate_ready, decision eligibility, or any order-execution route.
+    diagnostic_mode = request.args.get("diagnostic", "0").strip().lower() in {
+        "1", "true", "yes"
+    }
+    if diagnostic_mode and direction != "BULLISH":
+        vertical_type = "BULL CALL"
+        option_type_needed = "CALL"
+
+    # Without explicit diagnostic mode, preserve original early WAIT behavior.
+    if direction != "BULLISH" and not diagnostic_mode:
         return jsonify({
             "ok": True,
             "read_only": True,
@@ -7172,6 +7182,13 @@ def odts_vertical_test():
         "zlema_confirm": zlema_confirm,
         "direction": direction,
         "vertical_type": vertical_type,
+        "diagnostic_mode": diagnostic_mode,
+        "diagnostic_note": (
+            "Read-only BULL CALL candidate evaluation; market direction still blocks trading."
+            if diagnostic_mode and direction != "BULLISH"
+            else "Normal market-gated evaluation."
+        ),
+        "market_gate_ready": market_gate_ready,
         "decision": decision,
         "approval_status": approval_status,
         "selected_vertical": selected_vertical,
